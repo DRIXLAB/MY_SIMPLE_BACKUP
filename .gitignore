@@ -1,0 +1,11 @@
+# Builds (build.sh, SwiftPM, Xcode)
+build/
+dist/
+.build/
+.swiftpm/
+DerivedData/
+xcuserdata/
+*.xcodeproj/
+
+# macOS
+.DS_Store

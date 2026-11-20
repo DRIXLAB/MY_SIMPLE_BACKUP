@@ -1,0 +1,4 @@
+/* macOS permission prompts (English). */
+"NSDocumentsFolderUsageDescription" = "MY SIMPLE BACKUP needs access to your Documents to back them up.";
+"NSRemovableVolumesUsageDescription" = "MY SIMPLE BACKUP needs to write to the external disk chosen as the destination.";
+"NSNetworkVolumesUsageDescription" = "MY SIMPLE BACKUP needs to write to the network volume chosen as the destination.";

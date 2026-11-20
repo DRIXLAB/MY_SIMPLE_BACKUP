@@ -1,0 +1,4 @@
+/* Textes des demandes d'autorisation macOS (français). */
+"NSDocumentsFolderUsageDescription" = "MY SIMPLE BACKUP doit accéder à vos Documents pour les sauvegarder.";
+"NSRemovableVolumesUsageDescription" = "MY SIMPLE BACKUP doit écrire sur le disque externe choisi comme destination.";
+"NSNetworkVolumesUsageDescription" = "MY SIMPLE BACKUP doit écrire sur le volume réseau choisi comme destination.";
