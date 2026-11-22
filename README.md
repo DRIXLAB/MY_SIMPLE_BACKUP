@@ -14,6 +14,8 @@ Application macOS native (SwiftUI, macOS 13 Ventura ou plus récent) qui sauvega
 incrémentale les dossiers Documents, Images, Musique et Vidéos vers un disque externe, ainsi que
 la liste des applications installées. Aucune dépendance : ni Python, ni Homebrew, ni rsync.
 
+*Imaginé à Nantes par DrixLab - Développé par Claude dans les nuages*
+
 - **Copie incrémentale** : seuls les fichiers nouveaux ou modifiés (taille ou date) sont copiés ;
   permissions, dates et attributs étendus (étiquettes Finder…) sont conservés. Chaque fichier est
   écrit dans un fichier temporaire puis renommé : une copie interrompue ne laisse jamais de
@@ -89,6 +91,8 @@ et le modifier selon ces termes. Il est fourni sans aucune garantie.
 Native macOS app (SwiftUI, macOS 13 Ventura or later) that incrementally backs up the Documents,
 Pictures, Music and Movies folders to an external disk, along with the list of installed
 applications. No dependencies: no Python, no Homebrew, no rsync.
+
+*Imagined in Nantes by DrixLab - Developed by Claude in the clouds*
 
 - **Incremental copy**: only new or modified files (size or date) are copied; permissions, dates
   and extended attributes (Finder tags…) are preserved. Each file is written to a temporary file
