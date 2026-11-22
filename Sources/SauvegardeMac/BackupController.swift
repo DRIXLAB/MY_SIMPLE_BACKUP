@@ -34,7 +34,9 @@ final class BackupController: ObservableObject {
 
     @Published private(set) var access: [String: Bool] = [:]
     @Published private(set) var hasFullDiskAccess = true
-    @Published private(set) var sizes: [String: String] = [:]
+    /// Taille de chaque dossier en octets (-1 si le calcul a échoué). Gardée en nombre et non en
+    /// texte : elle est formatée à l'affichage, dans la langue courante.
+    @Published private(set) var sizes: [String: Int64] = [:]
     @Published private(set) var runningApps: [String: [String]] = [:]
     /// Journal de la dernière sauvegarde (en cours, ou la plus récente de l'historique).
     @Published private(set) var run: RunReport?
@@ -129,7 +131,7 @@ final class BackupController: ObservableObject {
                 let size = try? await BackupController.onDedicatedThread(qos: .utility) {
                     SystemInfo.allocatedSize(of: url)
                 }
-                await controller.setSize(size.map(SystemInfo.formatBytes) ?? "?", for: id)
+                await controller.setSize(size ?? -1, for: id)
             }
         }
     }
@@ -150,8 +152,8 @@ final class BackupController: ObservableObject {
 
     /// Méthode dédiée : Swift 5.9 refuse `controller.sizes[id] = …` dans `MainActor.run`
     /// (accès `inout` à une propriété isolée depuis un appel asynchrone).
-    private func setSize(_ text: String, for id: String) {
-        sizes[id] = text
+    private func setSize(_ bytes: Int64, for id: String) {
+        sizes[id] = bytes
     }
 
     func chooseDestination() {

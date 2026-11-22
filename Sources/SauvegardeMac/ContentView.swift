@@ -148,7 +148,7 @@ struct ContentView: View {
             if source.folderURL != nil {
                 Group {
                     if let size = controller.sizes[source.id] {
-                        Text(size)
+                        Text(size >= 0 ? SystemInfo.formatBytes(size) : "?")
                             .font(.callout.monospacedDigit())
                             .foregroundStyle(.secondary)
                     } else {

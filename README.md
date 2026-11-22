@@ -26,6 +26,8 @@ la liste des applications installées. Aucune dépendance : ni Python, ni Homebr
   historique des sauvegardes passées (⌘Y).
 - **Français ou anglais**, au choix dans l'application.
 
+<p align="center"><img src="docs/capture-fr.png" width="480" alt="Fenêtre de MY SIMPLE BACKUP en français"></p>
+
 ### Avertissement
 
 L'utilisation de cette application se fait **à vos propres risques et en toute connaissance de
@@ -98,6 +100,8 @@ applications. No dependencies: no Python, no Homebrew, no rsync.
 - **Log and history**: per-item details (files copied, items not copied) and history of past
   backups (⌘Y).
 - **French or English**, selectable in the app.
+
+<p align="center"><img src="docs/capture-en.png" width="480" alt="MY SIMPLE BACKUP window in English"></p>
 
 ### Disclaimer
 
