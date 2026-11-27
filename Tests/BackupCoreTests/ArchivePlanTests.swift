@@ -58,4 +58,12 @@ final class ArchivePlanTests: XCTestCase {
         let dirs = (0..<5).map { ArchiveItem(path: "d\($0)", kind: .directory, size: 0, modificationDate: Date()) }
         XCTAssertEqual(ArchivePlan.batches(dirs, partSize: 100).count, 1)
     }
+
+    func testLogicalFileNameOfICloudPlaceholders() {
+        XCTAssertEqual(ArchivePlan.logicalFileName(".archive-0001.aea.icloud"), "archive-0001.aea")
+        XCTAssertEqual(ArchivePlan.logicalFileName(".cle.json.icloud"), "cle.json")
+        XCTAssertEqual(ArchivePlan.logicalFileName("archive-0001.aea"), "archive-0001.aea")
+        XCTAssertEqual(ArchivePlan.logicalFileName(".cache"), ".cache")
+        XCTAssertEqual(ArchivePlan.logicalFileName(".icloud"), ".icloud")
+    }
 }

@@ -75,6 +75,15 @@ public enum ArchivePlan {
         return result
     }
 
+    /// Nom réel d'un fichier iCloud Drive. Avant macOS 14, un fichier dont la copie locale a été
+    /// libérée est remplacé sur le disque par un fichier caché « .nom.icloud » ; à partir de
+    /// macOS 14, il garde son nom. Toute lecture d'un dossier iCloud doit passer par ici.
+    public static func logicalFileName(_ name: String) -> String {
+        let suffix = ".icloud"
+        guard name.hasPrefix("."), name.hasSuffix(suffix), name.count > suffix.count + 1 else { return name }
+        return String(name.dropFirst().dropLast(suffix.count))
+    }
+
     /// Répartit les éléments en lots consécutifs d'au plus `partSize` octets. Un fichier plus gros
     /// que `partSize` forme un lot à lui seul. Aucun lot n'est vide ; l'ordre est conservé.
     public static func batches(_ items: [ArchiveItem], partSize: Int64) -> [[ArchiveItem]] {

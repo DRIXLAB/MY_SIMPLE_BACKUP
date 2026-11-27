@@ -263,9 +263,12 @@ public enum EncryptedArchive {
 
     // MARK: Relecture
 
-    /// Morceaux d'une archive, dans l'ordre.
+    /// Morceaux d'une archive, dans l'ordre, sous leur nom réel : un morceau dont la copie locale a
+    /// été libérée (« .archive-0001.aea.icloud » avant macOS 14) est rendu sous le nom
+    /// « archive-0001.aea », à télécharger avant lecture (`ICloudDrive.download`).
     public static func parts(in partsDirectory: URL) throws -> [URL] {
-        let names = ((try? FileManager.default.contentsOfDirectory(atPath: partsDirectory.path)) ?? [])
+        let listed = (try? FileManager.default.contentsOfDirectory(atPath: partsDirectory.path)) ?? []
+        let names = Set(listed.map(ArchivePlan.logicalFileName))
             .filter { $0.hasPrefix(partPrefix) && $0.hasSuffix(partSuffix) }
             .sorted()
         guard !names.isEmpty else { throw Failure.noParts(partsDirectory.path) }
@@ -273,21 +276,22 @@ public enum EncryptedArchive {
     }
 
     /// Déchiffre et extrait tous les morceaux de `partsDirectory` dans `destination`.
-    /// - Parameter beforeReadingPart: appelé avant chaque morceau (par exemple pour le télécharger
-    ///   depuis iCloud) ; peut bloquer ou lever une erreur.
+    /// - Parameter beforeReading: appelé avant de lire chaque fichier (`cle.json` puis chaque
+    ///   morceau), par exemple pour le télécharger depuis iCloud ; peut bloquer ou lever une erreur.
     public static func extract(
         from partsDirectory: URL,
         to destination: URL,
         password: String,
-        beforeReadingPart: (URL) throws -> Void = { _ in },
+        beforeReading: (URL) throws -> Void = { _ in },
         isCancelled: () -> Bool = { false }
     ) throws {
         let partURLs = try parts(in: partsDirectory)
+        try beforeReading(partsDirectory.appendingPathComponent(keyFileName))
         let key = try deriveKey(password: password, parameters: try readKeyParameters(in: partsDirectory))
         try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
         for part in partURLs {
             if isCancelled() { throw Failure.cancelled }
-            try beforeReadingPart(part)
+            try beforeReading(part)
             try extractPart(part, to: destination, key: key)
         }
     }

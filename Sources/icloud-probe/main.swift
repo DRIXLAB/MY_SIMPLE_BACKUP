@@ -118,7 +118,7 @@ for part in parts {
 step("5/6  Retéléchargement depuis iCloud et déchiffrement")
 do {
     try EncryptedArchive.extract(from: partsFolder, to: restored, password: password,
-                                 beforeReadingPart: { part in
+                                 beforeReading: { part in
                                      let wasLocal = ICloudDrive.isDownloaded(part)
                                      try ICloudDrive.download(part, timeout: 30 * 60)
                                      ok("\(part.lastPathComponent) \(wasLocal ? "déjà local" : "retéléchargé")")

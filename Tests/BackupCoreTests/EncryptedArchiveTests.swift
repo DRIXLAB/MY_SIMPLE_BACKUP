@@ -173,6 +173,23 @@ final class EncryptedArchiveTests: XCTestCase {
         XCTAssertNotEqual(try bytes("secret"), try bytes("autre"))
     }
 
+    func testPartsListsICloudPlaceholdersUnderTheirRealName() throws {
+        try fm.createDirectory(at: parts, withIntermediateDirectories: true)
+        try Data().write(to: parts.appendingPathComponent("archive-0001.aea"))
+        try Data().write(to: parts.appendingPathComponent(".archive-0002.aea.icloud"))
+        try Data().write(to: parts.appendingPathComponent(".autre.icloud"))
+        XCTAssertEqual(try EncryptedArchive.parts(in: parts).map(\.lastPathComponent),
+                       ["archive-0001.aea", "archive-0002.aea"])
+    }
+
+    func testBeforeReadingIsCalledForKeyFileThenEachPart() throws {
+        let result = try create()
+        var seen: [String] = []
+        try EncryptedArchive.extract(from: parts, to: restored, password: "secret",
+                                     beforeReading: { seen.append($0.lastPathComponent) })
+        XCTAssertEqual(seen, [EncryptedArchive.keyFileName] + result.parts.map(\.lastPathComponent))
+    }
+
     func testMissingKeyFileIsDetected() throws {
         _ = try create()
         try fm.removeItem(at: parts.appendingPathComponent(EncryptedArchive.keyFileName))
