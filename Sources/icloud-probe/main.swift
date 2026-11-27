@@ -55,16 +55,18 @@ let restored = work.appendingPathComponent("restauration")
 do {
     try fm.createDirectory(at: source.appendingPathComponent("sous-dossier"), withIntermediateDirectories: true)
     try Data("Fichier texte de test MY SIMPLE BACKUP".utf8).write(to: source.appendingPathComponent("note.txt"))
-    var random = Data(count: 10 * 1024 * 1024)
-    random.withUnsafeMutableBytes { arc4random_buf($0.baseAddress!, $0.count) }
-    try random.write(to: source.appendingPathComponent("sous-dossier/donnees.bin"))
+    for index in 1...3 {
+        var random = Data(count: 3 * 1024 * 1024)
+        random.withUnsafeMutableBytes { arc4random_buf($0.baseAddress!, $0.count) }
+        try random.write(to: source.appendingPathComponent("sous-dossier/donnees-\(index).bin"))
+    }
 } catch {
     fail("Création des fichiers de test impossible : \(error.localizedDescription)")
 }
-ok("10 Mo de données aléatoires + un fichier texte")
+ok("3 fichiers de 3 Mo de données aléatoires + un fichier texte")
 
 // ── 3. Archive chiffrée vers iCloud ──
-step("3/6  Archive chiffrée, morceaux de 4 Mo, écrite dans iCloud")
+step("3/6  Archive chiffrée, morceaux d'environ 4 Mo, écrite dans iCloud")
 let stamp = ISO8601DateFormatter().string(from: Date()).replacingOccurrences(of: ":", with: "-")
 let partsFolder = iCloudFolder.appendingPathComponent("diagnostic-\(stamp)", isDirectory: true)
 var parts: [URL] = []
@@ -72,7 +74,7 @@ do {
     parts = try EncryptedArchive.create(from: source, to: partsFolder, password: password, partSize: partSize,
                                         onPartCompleted: { url, size in
                                             ok("\(url.lastPathComponent) écrit (\(L10n.bytes(size)))")
-                                        })
+                                        }).parts
 } catch {
     fail("Archivage impossible : \(error.localizedDescription)")
 }
@@ -128,7 +130,7 @@ ok("Archive déchiffrée et extraite")
 
 // ── 6. Vérification ──
 step("6/6  Vérification")
-for rel in ["note.txt", "sous-dossier/donnees.bin"] {
+for rel in ["note.txt", "sous-dossier/donnees-1.bin", "sous-dossier/donnees-2.bin", "sous-dossier/donnees-3.bin"] {
     let original = try? Data(contentsOf: source.appendingPathComponent(rel))
     let copy = try? Data(contentsOf: restored.appendingPathComponent(rel))
     guard let original, original == copy else { fail("\(rel) : contenu différent après restauration") }
