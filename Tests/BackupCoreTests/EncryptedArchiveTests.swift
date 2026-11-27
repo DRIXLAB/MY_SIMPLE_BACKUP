@@ -47,9 +47,15 @@ final class EncryptedArchiveTests: XCTestCase {
                                                   onPartCompleted: { completed.append(($0, $1)) })
         XCTAssertGreaterThanOrEqual(written.count, 4)
         XCTAssertEqual(written, try EncryptedArchive.parts(in: parts))
-        XCTAssertEqual(completed.map(\.0), written)
-        XCTAssertTrue(completed.dropLast().allSatisfy { $0.1 == partSize })
         XCTAssertEqual(written.first?.lastPathComponent, "archive.aea.0001")
+        // Chaque morceau est signalé une fois ; le premier en dernier (prologue AEA réécrit à la fin).
+        XCTAssertEqual(Set(completed.map(\.0)), Set(written))
+        XCTAssertEqual(completed.count, written.count)
+        XCTAssertEqual(completed.last?.0, written.first)
+        // Tous les morceaux sont pleins, sauf le dernier.
+        for (url, size) in completed where url != written.last {
+            XCTAssertEqual(size, partSize, url.lastPathComponent)
+        }
 
         // Le contenu n'apparaît pas en clair dans les morceaux.
         let firstPart = try Data(contentsOf: written[0])
@@ -83,7 +89,7 @@ final class EncryptedArchiveTests: XCTestCase {
         XCTAssertEqual(calls, written.count)
     }
 
-    func testCancellationStopsAndLeavesOnlyCompleteParts() throws {
+    func testCancellationStopsAndRemovesAllParts() throws {
         var completedCount = 0
         XCTAssertThrowsError(try EncryptedArchive.create(
             from: source, to: parts, password: "secret", partSize: partSize,
@@ -92,12 +98,9 @@ final class EncryptedArchiveTests: XCTestCase {
         )) { error in
             XCTAssertEqual(error as? EncryptedArchive.Failure, .cancelled)
         }
-        let remaining = (try? EncryptedArchive.parts(in: parts)) ?? []
-        XCTAssertEqual(remaining.count, completedCount)
-        for part in remaining {
-            let size = try fm.attributesOfItem(atPath: part.path)[.size] as? NSNumber
-            XCTAssertEqual(size?.int64Value, partSize)
-        }
+        // Archive inachevée (prologue jamais écrit) : indéchiffrable, donc tout est supprimé.
+        XCTAssertGreaterThanOrEqual(completedCount, 1)
+        XCTAssertEqual((try? EncryptedArchive.parts(in: parts)) ?? [], [])
     }
 
     func testErrorInBeforeNewPartIsPropagated() throws {
@@ -112,6 +115,7 @@ final class EncryptedArchiveTests: XCTestCase {
         )) { error in
             XCTAssertTrue(error is Plein, "\(error)")
         }
+        XCTAssertEqual((try? EncryptedArchive.parts(in: parts)) ?? [], [])
     }
 }
 #endif

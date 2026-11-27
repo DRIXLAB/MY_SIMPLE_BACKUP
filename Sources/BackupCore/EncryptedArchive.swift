@@ -6,12 +6,17 @@ import System
 /// Archive Apple Archive compressée (LZFSE) et chiffrée par mot de passe (AEA, AES-256),
 /// écrite et relue **au fil de l'eau** et découpée en morceaux (`archive.aea.0001`, `.0002`…).
 ///
-/// Le découpage passe par un tube (`pipe`) : Apple Archive écrit le flux chiffré dans le tube, un
-/// thread le lit et le répartit en morceaux de `partSize` octets. Un morceau n'est qu'une tranche
-/// du flux chiffré : la relecture recolle les morceaux dans l'ordre (`extract`). Le crochet
-/// `beforeNewPart` est appelé avant chaque nouveau morceau et peut bloquer : tant qu'il bloque,
-/// plus rien n'est lu dans le tube et Apple Archive attend (contre-pression), ce qui limite
-/// l'espace disque utilisé localement.
+/// Écriture : Apple Archive écrit dans un flux personnalisé (`PartedSink`) qui répartit les octets
+/// en morceaux de `partSize`. Le chiffrement AEA réécrit son en-tête (« prologue ») **à la fin**, à
+/// l'offset 0 : le flux doit accepter les écritures positionnées (un tube ne convient pas), et le
+/// **premier morceau** reste donc ouvert jusqu'à la fermeture ; il n'est signalé terminé
+/// (`onPartCompleted`) qu'en dernier. Les autres morceaux sont signalés dès qu'ils sont pleins.
+/// `beforeNewPart` est appelé avant chaque nouveau morceau et peut bloquer : Apple Archive attend
+/// alors (contre-pression), ce qui limite l'espace disque utilisé localement.
+///
+/// Relecture : un thread recolle les morceaux dans l'ordre dans un tube lu par Apple Archive.
+///
+/// Une archive inachevée (erreur, annulation) est indéchiffrable : tous ses morceaux sont supprimés.
 ///
 /// macOS uniquement (Apple Archive) ; testé par `EncryptedArchiveTests` sur Mac.
 public enum EncryptedArchive {
@@ -68,58 +73,42 @@ public enum EncryptedArchive {
         isCancelled: @escaping () -> Bool = { false }
     ) throws -> [URL] {
         try FileManager.default.createDirectory(at: partsDirectory, withIntermediateDirectories: true)
-        let (readEnd, writeEnd) = try makePipe()
-
-        // Thread lecteur : tube → morceaux.
-        let splitter = PartSplitter(directory: partsDirectory, partSize: partSize,
-                                    beforeNewPart: beforeNewPart, onPartCompleted: onPartCompleted,
-                                    isCancelled: isCancelled)
-        let done = DispatchSemaphore(value: 0)
-        let thread = Thread {
-            splitter.run(readingFrom: readEnd)
-            close(readEnd)
-            done.signal()
-        }
-        thread.stackSize = 1 << 20
-        thread.start()
-
-        // Thread courant : dossier → archive → compression + chiffrement → tube.
-        var archiveError: Error?
+        let sink = PartedSink(directory: partsDirectory, partSize: partSize, beforeNewPart: beforeNewPart,
+                              onPartCompleted: onPartCompleted, isCancelled: isCancelled)
         do {
-            try writeArchive(of: sourceDirectory, toDescriptor: writeEnd, password: password)
+            try writeArchive(of: sourceDirectory, to: sink, password: password)
+            return try sink.finish()
         } catch {
-            archiveError = error
+            sink.abandon()
+            // Une erreur levée par le flux (annulation, crochet) prime sur celle d'Apple Archive.
+            if let failure = sink.failure { throw failure }
+            throw (error as? Failure) ?? Failure.io(error.localizedDescription)
         }
-        done.wait()
-
-        // Une annulation ou une erreur côté morceaux ferme le tube et fait échouer Apple Archive :
-        // c'est alors la cause d'origine qu'on remonte.
-        if let splitterError = splitter.error { throw splitterError }
-        if let archiveError {
-            throw (archiveError as? Failure) ?? Failure.io(archiveError.localizedDescription)
-        }
-        return splitter.parts
     }
 
-    /// Fermetures explicites et dans l'ordre (archive, chiffrement, fichier) : une erreur lors de
+    /// Fermetures explicites et dans l'ordre (archive, chiffrement, flux) : une erreur lors de
     /// l'écriture finale doit remonter, sinon l'archive serait tronquée sans avertissement.
-    private static func writeArchive(of sourceDirectory: URL, toDescriptor fd: Int32, password: String) throws {
-        guard let fileStream = ArchiveByteStream.fileStream(fd: FileDescriptor(rawValue: fd), automaticClose: true) else {
-            close(fd)
-            throw Failure.cannotCreateStream("fd")
+    private static func writeArchive(of sourceDirectory: URL, to sink: PartedSink, password: String) throws {
+        guard let output = ArchiveByteStream.customStream(instance: sink) else {
+            throw Failure.cannotCreateStream("output")
         }
         let context = ArchiveEncryptionContext(profile: .hkdf_sha256_aesctr_hmac__scrypt__none,
                                                compressionAlgorithm: .lzfse)
-        guard (try? context.setPassword(password)) != nil,
-              let encryptionStream = ArchiveByteStream.encryptionStream(writingTo: fileStream,
+        do {
+            try context.setPassword(password)
+        } catch {
+            try? output.close()
+            throw Failure.cannotCreateStream("password")
+        }
+        guard let encryptionStream = ArchiveByteStream.encryptionStream(writingTo: output,
                                                                         encryptionContext: context) else {
-            try? fileStream.close()
+            try? output.close()
             throw Failure.cannotCreateStream("encryption")
         }
         guard let encoder = ArchiveStream.encodeStream(writingTo: encryptionStream),
               let keySet = ArchiveHeader.FieldKeySet(fieldKeys) else {
             try? encryptionStream.close()
-            try? fileStream.close()
+            try? output.close()
             throw Failure.cannotCreateStream("encode")
         }
         do {
@@ -127,17 +116,17 @@ public enum EncryptedArchive {
         } catch {
             try? encoder.close()
             try? encryptionStream.close()
-            try? fileStream.close()
+            try? output.close()
             throw error
         }
         do {
             try encoder.close()
             try encryptionStream.close()
         } catch {
-            try? fileStream.close()
+            try? output.close()
             throw error
         }
-        try fileStream.close()
+        try output.close()
     }
 
     // MARK: Relecture
@@ -246,15 +235,27 @@ public enum EncryptedArchive {
 
 // MARK: - Découpage en morceaux
 
-private final class PartSplitter {
+/// Flux d'écriture Apple Archive réparti en morceaux. Écritures séquentielles : à la suite, en
+/// ouvrant un nouveau morceau quand le courant est plein. Écritures et lectures positionnées
+/// (prologue AEA réécrit à l'offset 0 en fin de chiffrement) : dans le morceau concerné.
+private final class PartedSink: ArchiveByteStreamProtocol {
+    private struct Part {
+        let url: URL
+        var size: Int64
+        var completed = false
+    }
+
     let directory: URL
     let partSize: Int64
     let beforeNewPart: () throws -> Void
     let onPartCompleted: (URL, Int64) -> Void
     let isCancelled: () -> Bool
 
-    private(set) var parts: [URL] = []
-    private(set) var error: Error?
+    private var parts: [Part] = []
+    /// Descripteurs ouverts : morceau courant et premier morceau (réécrit à la fin).
+    private var openFiles: [Int: Int32] = [:]
+    private let lock = NSLock()
+    private(set) var failure: Error?
 
     init(directory: URL, partSize: Int64, beforeNewPart: @escaping () throws -> Void,
          onPartCompleted: @escaping (URL, Int64) -> Void, isCancelled: @escaping () -> Bool) {
@@ -265,62 +266,170 @@ private final class PartSplitter {
         self.isCancelled = isCancelled
     }
 
-    func run(readingFrom fd: Int32) {
-        let bufferSize = 1 << 20
-        let buffer = UnsafeMutableRawPointer.allocate(byteCount: bufferSize, alignment: 16)
-        defer { buffer.deallocate() }
+    deinit {
+        for fd in openFiles.values { Darwin.close(fd) }
+    }
 
-        var current: FileHandle?
-        var currentURL: URL?
-        var written: Int64 = 0
+    // MARK: ArchiveByteStreamProtocol
 
-        func finishPart() {
-            guard let handle = current, let url = currentURL else { return }
-            try? handle.synchronize()
-            try? handle.close()
-            current = nil
-            parts.append(url)
-            onPartCompleted(url, written)
+    func write(from buffer: UnsafeRawBufferPointer) throws -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return try guarded {
+            if isCancelled() { throw EncryptedArchive.Failure.cancelled }
+            var done = 0
+            while done < buffer.count {
+                if parts.isEmpty || parts[parts.count - 1].size >= partSize {
+                    try startNewPart()
+                }
+                let index = parts.count - 1
+                let room = Int(partSize - parts[index].size)
+                let count = min(room, buffer.count - done)
+                try pwriteAll(UnsafeRawBufferPointer(rebasing: buffer[done..<(done + count)]),
+                              part: index, at: parts[index].size)
+                parts[index].size += Int64(count)
+                done += count
+            }
+            return buffer.count
         }
+    }
 
+    func write(from buffer: UnsafeRawBufferPointer, atOffset offset: Int64) throws -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return try guarded {
+            var done = 0
+            while done < buffer.count {
+                let absolute = offset + Int64(done)
+                let index = Int(absolute / partSize)
+                let local = absolute % partSize
+                guard index < parts.count else { throw EncryptedArchive.Failure.io("write beyond end") }
+                if parts[index].completed && index != 0 {
+                    // Morceau déjà confié à l'envoi (et peut-être libéré) : on ne peut plus le modifier.
+                    throw EncryptedArchive.Failure.io("rewrite of a completed part (\(index + 1))")
+                }
+                let count = min(Int(partSize - local), buffer.count - done)
+                try pwriteAll(UnsafeRawBufferPointer(rebasing: buffer[done..<(done + count)]), part: index, at: local)
+                parts[index].size = max(parts[index].size, local + Int64(count))
+                done += count
+            }
+            return buffer.count
+        }
+    }
+
+    func read(into buffer: UnsafeMutableRawBufferPointer, atOffset offset: Int64) throws -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return try guarded {
+            let index = Int(offset / partSize)
+            guard index < parts.count else { return 0 }
+            let local = offset % partSize
+            let available = Int(max(0, parts[index].size - local))
+            let count = min(buffer.count, available)
+            guard count > 0 else { return 0 }
+            let fd = try descriptor(for: index)
+            let n = pread(fd, buffer.baseAddress, count, local)
+            guard n >= 0 else { throw EncryptedArchive.Failure.io(String(cString: strerror(errno))) }
+            return n
+        }
+    }
+
+    func read(into buffer: UnsafeMutableRawBufferPointer) throws -> Int {
+        throw EncryptedArchive.Failure.io("sequential read not supported")
+    }
+
+    func seek(toOffset offset: Int64, relativeTo origin: FileDescriptor.SeekOrigin) throws -> Int64 {
+        throw EncryptedArchive.Failure.io("seek not supported")
+    }
+
+    func cancel() {}
+
+    func close() throws {}
+
+    // MARK: Fin
+
+    /// Fin normale : synchronise et ferme les morceaux, signale ceux qui restaient (le premier en
+    /// dernier, puisqu'il vient d'être réécrit) et renvoie la liste ordonnée.
+    func finish() throws -> [URL] {
+        lock.lock()
+        defer { lock.unlock() }
+        for index in openFiles.keys.sorted(by: >) {
+            try closeFile(index, sync: true)
+        }
+        for index in parts.indices.reversed() where !parts[index].completed {
+            parts[index].completed = true
+            onPartCompleted(parts[index].url, parts[index].size)
+        }
+        return parts.map(\.url)
+    }
+
+    /// Échec ou annulation : l'archive est inutilisable, tous ses morceaux sont supprimés.
+    func abandon() {
+        lock.lock()
+        defer { lock.unlock() }
+        for fd in openFiles.values { Darwin.close(fd) }
+        openFiles.removeAll()
+        for part in parts { try? FileManager.default.removeItem(at: part.url) }
+        parts.removeAll()
+    }
+
+    // MARK: Morceaux
+
+    /// Mémorise la première erreur levée (elle prime sur celle qu'Apple Archive en déduira).
+    private func guarded<T>(_ body: () throws -> T) throws -> T {
         do {
-            while true {
-                if isCancelled() { throw EncryptedArchive.Failure.cancelled }
-                let count = read(fd, buffer, bufferSize)
-                if count < 0 {
-                    if errno == EINTR { continue }
-                    throw EncryptedArchive.Failure.io(String(cString: strerror(errno)))
-                }
-                if count == 0 { break }
-
-                var offset = 0
-                while offset < count {
-                    if current == nil {
-                        try beforeNewPart()
-                        let name = EncryptedArchive.partPrefix + String(format: "%04d", parts.count + 1)
-                        let url = directory.appendingPathComponent(name)
-                        guard FileManager.default.createFile(atPath: url.path, contents: nil) else {
-                            throw EncryptedArchive.Failure.io(tr("Impossible de créer \(url.path)", "Cannot create \(url.path)"))
-                        }
-                        current = try FileHandle(forWritingTo: url)
-                        currentURL = url
-                        written = 0
-                    }
-                    let room = Int(min(Int64(count - offset), partSize - written))
-                    try current!.write(contentsOf: Data(bytes: buffer + offset, count: room))
-                    written += Int64(room)
-                    offset += room
-                    if written >= partSize { finishPart() }
-                }
-            }
-            finishPart()
+            return try body()
         } catch {
-            self.error = error
-            // Morceau inachevé : supprimé, il ne doit jamais être pris pour un morceau valide.
-            if let handle = current {
-                try? handle.close()
-                if let url = currentURL { try? FileManager.default.removeItem(at: url) }
+            if failure == nil { failure = error }
+            throw error
+        }
+    }
+
+    private func startNewPart() throws {
+        if let last = parts.indices.last, last != 0 {
+            // Morceau plein (sauf le premier, réécrit à la fin) : fermé, synchronisé et signalé.
+            try closeFile(last, sync: true)
+            parts[last].completed = true
+            onPartCompleted(parts[last].url, parts[last].size)
+        }
+        try beforeNewPart()
+        let name = EncryptedArchive.partPrefix + String(format: "%04d", parts.count + 1)
+        let url = directory.appendingPathComponent(name)
+        let fd = open(url.path, O_RDWR | O_CREAT | O_TRUNC, 0o644)
+        guard fd >= 0 else {
+            throw EncryptedArchive.Failure.io(tr("Impossible de créer \(url.path)", "Cannot create \(url.path)")
+                                              + " (\(String(cString: strerror(errno))))")
+        }
+        openFiles[parts.count] = fd
+        parts.append(Part(url: url, size: 0))
+    }
+
+    private func descriptor(for index: Int) throws -> Int32 {
+        if let fd = openFiles[index] { return fd }
+        let fd = open(parts[index].url.path, O_RDWR)
+        guard fd >= 0 else { throw EncryptedArchive.Failure.io(String(cString: strerror(errno))) }
+        openFiles[index] = fd
+        return fd
+    }
+
+    private func closeFile(_ index: Int, sync: Bool) throws {
+        guard let fd = openFiles.removeValue(forKey: index) else { return }
+        defer { Darwin.close(fd) }
+        if sync, fsync(fd) != 0 {
+            throw EncryptedArchive.Failure.io(String(cString: strerror(errno)))
+        }
+    }
+
+    private func pwriteAll(_ buffer: UnsafeRawBufferPointer, part index: Int, at offset: Int64) throws {
+        let fd = try descriptor(for: index)
+        var done = 0
+        while done < buffer.count {
+            let n = pwrite(fd, buffer.baseAddress! + done, buffer.count - done, offset + Int64(done))
+            if n < 0 {
+                if errno == EINTR { continue }
+                throw EncryptedArchive.Failure.io(String(cString: strerror(errno)))
             }
+            done += n
         }
     }
 }
