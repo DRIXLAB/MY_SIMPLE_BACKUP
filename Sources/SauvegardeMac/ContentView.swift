@@ -13,6 +13,7 @@ struct ContentView: View {
             destinationSection
             sourcesSection
             optionsSection
+            iCloudSection
             actionSection
             logSection
         }
@@ -37,6 +38,9 @@ struct ContentView: View {
         }
         .sheet(isPresented: $controller.showHistory) {
             HistoryView(controller: controller)
+        }
+        .sheet(isPresented: $controller.showICloudSettings) {
+            ICloudSettingsView(controller: controller)
         }
     }
 
@@ -192,6 +196,44 @@ struct ContentView: View {
 
     // MARK: Options
 
+    // MARK: iCloud
+
+    private var iCloudSection: some View {
+        GroupBox(tr("iCloud Drive", "iCloud Drive")) {
+            VStack(alignment: .leading, spacing: 2) {
+                HStack {
+                    Toggle(tr("Sauvegarder aussi vers iCloud Drive (archive chiffrée)",
+                              "Also back up to iCloud Drive (encrypted archive)"),
+                           isOn: $controller.iCloudEnabled)
+                        .toggleStyle(.checkbox)
+                    Spacer()
+                    Button(tr("Réglages…", "Settings…")) { controller.showICloudSettings = true }
+                }
+                if controller.iCloudEnabled {
+                    Group {
+                        if let problem = controller.iCloudProblem {
+                            Label(problem, systemImage: "exclamationmark.triangle.fill")
+                                .foregroundStyle(.orange)
+                        } else {
+                            let folder = controller.iCloudFolderDisplay ?? ""
+                            let extra = controller.pendingFullArchive.isEmpty
+                                ? tr("mot de passe enregistré", "password saved")
+                                : tr("prochaine sauvegarde : archive complète", "next backup: full archive")
+                            Text("\(folder)  ·  \(extra)")
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .font(.caption)
+                    .lineLimit(2)
+                    .padding(.leading, 20)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(4)
+        }
+        .disabled(controller.isRunning)
+    }
+
     private var optionsSection: some View {
         GroupBox(tr("Options", "Options")) {
             VStack(alignment: .leading, spacing: 2) {
@@ -242,7 +284,7 @@ struct ContentView: View {
 
     private var logSection: some View {
         GroupBox {
-            JournalView(run: controller.run, progress: controller.progress)
+            JournalView(run: controller.run, progress: controller.progress, cloudProgress: controller.cloudProgress)
                 .padding(4)
         } label: {
             HStack {

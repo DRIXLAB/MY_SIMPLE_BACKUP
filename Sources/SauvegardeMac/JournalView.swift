@@ -6,6 +6,8 @@ import SwiftUI
 struct JournalView: View {
     let run: RunReport?
     let progress: SyncProgress?
+    /// Avancement de la ligne iCloud en cours.
+    var cloudProgress: CloudProgress? = nil
     /// Hauteur de la liste défilante des éléments ; `nil` : pas de défilement propre
     /// (la vue est placée dans un conteneur qui défile, comme l'historique).
     var listHeight: CGFloat? = 228
@@ -38,7 +40,9 @@ struct JournalView: View {
     private func rows(_ run: RunReport) -> some View {
         VStack(spacing: 6) {
             ForEach(run.sources) { source in
-                SourceRow(report: source, progress: source.status == .running ? progress : nil)
+                SourceRow(report: source,
+                          progress: source.status == .running ? progress : nil,
+                          cloudProgress: source.status == .running && source.isCloud ? cloudProgress : nil)
                     .id(source.id)
             }
         }
@@ -157,6 +161,8 @@ private struct SourceRow: View {
     let report: SourceReport
     /// Progression du moteur, uniquement pour l'élément en cours.
     let progress: SyncProgress?
+    /// Avancement iCloud, uniquement pour la ligne iCloud en cours.
+    var cloudProgress: CloudProgress? = nil
     @State private var showIssues = false
 
     private static let maxIssuesShown = 200
@@ -223,6 +229,8 @@ private struct SourceRow: View {
         switch report.status {
         case .pending:
             Text(tr("En attente", "Waiting"))
+        case .running where report.isCloud:
+            cloudSubtitle
         case .running:
             if let p = progress, p.phase == .transferring {
                 let done = SystemInfo.formatBytes(p.bytesDone), total = SystemInfo.formatBytes(p.bytesTotal)
@@ -265,15 +273,42 @@ private struct SourceRow: View {
         }
     }
 
+    /// Étapes d'une ligne iCloud : analyse, archivage chiffré, envoi (ou attente d'iCloud).
+    @ViewBuilder
+    private var cloudSubtitle: some View {
+        let cloud = cloudProgress ?? CloudProgress()
+        let uploaded = SystemInfo.formatBytes(cloud.uploadedBytes)
+        let pending = SystemInfo.formatBytes(cloud.pendingBytes)
+        if cloud.waitingForICloud {
+            Text(tr("En attente d'iCloud (réseau, iCloud en pause ?)  ·  \(pending) à envoyer",
+                    "Waiting for iCloud (network, iCloud paused?)  ·  \(pending) to upload"))
+                .foregroundStyle(.orange)
+        } else {
+            switch cloud.phase {
+            case .scanning:
+                Text(tr("Recherche des changements…", "Looking for changes…"))
+            case .archiving:
+                let parts = L10n.count(cloud.partsWritten, "morceau chiffré", "morceaux chiffrés", "encrypted part", "encrypted parts")
+                Text(tr("Archivage : \(parts)  ·  envoyé : \(uploaded)", "Archiving: \(parts)  ·  uploaded: \(uploaded)"))
+            case .uploading:
+                Text(tr("Envoi vers iCloud : \(uploaded) envoyés  ·  \(pending) en attente",
+                        "Uploading to iCloud: \(uploaded) sent  ·  \(pending) pending"))
+            }
+        }
+    }
+
     private var progressBar: some View {
         VStack(alignment: .leading, spacing: 2) {
-            if let p = progress, p.phase == .transferring {
+            if report.isCloud {
+                ProgressView()
+                    .progressViewStyle(.linear)
+            } else if let p = progress, p.phase == .transferring {
                 ProgressView(value: p.fraction)
             } else {
                 ProgressView()
                     .progressViewStyle(.linear)
             }
-            Text(progress?.currentPath ?? " ")
+            Text(report.isCloud ? " " : (progress?.currentPath ?? " "))
                 .font(.caption2)
                 .foregroundStyle(.tertiary)
                 .lineLimit(1)

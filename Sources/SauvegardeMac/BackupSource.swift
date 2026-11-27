@@ -33,7 +33,9 @@ struct BackupSource: Identifiable, Hashable {
     /// Nom affiché d'un élément du journal, dans la langue courante (l'historique enregistre
     /// le nom dans la langue du moment de la sauvegarde).
     static func label(for report: SourceReport) -> String {
-        all.first { $0.id == report.id }?.label ?? report.label
+        let id = report.isCloud ? String(report.id.dropFirst(SourceReport.cloudPrefix.count)) : report.id
+        let name = all.first { $0.id == id }?.label ?? report.label
+        return report.isCloud ? name + " → iCloud" : name
     }
 
     var folderURL: URL? {

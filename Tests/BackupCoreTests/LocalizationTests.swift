@@ -79,4 +79,25 @@ final class LocalizationTests: XCTestCase {
         XCTAssertEqual(runs.count, 1)
         XCTAssertEqual(runs.first?.sources.first?.displaySummary, "10 fichiers")
     }
+
+    func testCloudSummary() {
+        var report = SourceReport(id: "icloud:documents", label: "Documents", symbol: "icloud.fill")
+        report.status = .success
+        report.sourceFiles = 120
+        L10n.language = .french
+        XCTAssertTrue(report.isCloud)
+        XCTAssertEqual(report.displaySummary, "aucun changement à envoyer  ·  120 fichiers")
+        report.cloudStep = 0
+        report.cloudFull = true
+        report.copiedFiles = 120
+        report.copiedBytes = 3_000_000
+        XCTAssertEqual(report.displaySummary, "archive complète  ·  120 fichiers envoyés  ·  3 Mo")
+        report.cloudStep = 4
+        report.cloudFull = false
+        report.copiedFiles = 1
+        report.copiedBytes = 0
+        report.deletedItems = 2
+        L10n.language = .english
+        XCTAssertEqual(report.displaySummary, "increment #4  ·  1 file uploaded  ·  2 deleted")
+    }
 }

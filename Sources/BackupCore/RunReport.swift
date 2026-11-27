@@ -30,6 +30,14 @@ public struct SourceReport: Identifiable, Equatable, Codable, Sendable {
     public var skippedItems: Int?
     /// Nombre d'applications inventoriées (élément « Liste des applications »).
     public var applicationCount: Int?
+    /// Sauvegarde iCloud : étape créée dans la chaîne (`nil` : aucun changement à envoyer).
+    public var cloudStep: Int?
+    /// Sauvegarde iCloud : l'étape est une archive complète.
+    public var cloudFull: Bool?
+
+    /// Préfixe des lignes du journal consacrées à iCloud (« icloud:documents »).
+    public static let cloudPrefix = "icloud:"
+    public var isCloud: Bool { id.hasPrefix(Self.cloudPrefix) }
 
     /// Résumé dans la langue courante (« 12 345 fichiers · 42 copiés · 1,2 Go »).
     public var displaySummary: String? {
@@ -45,6 +53,21 @@ public struct SourceReport: Identifiable, Equatable, Codable, Sendable {
             if let apps = applicationCount {
                 return L10n.count(apps, "application", "applications", "application", "applications")
                     + "  ·  " + AppInventory.fileName
+            }
+            if isCloud, let files = sourceFiles {
+                guard let step = cloudStep else {
+                    return tr("aucun changement à envoyer", "no changes to upload")
+                        + "  ·  " + L10n.count(files, "fichier", "fichiers", "file", "files")
+                }
+                var parts = [cloudFull == true
+                    ? tr("archive complète", "full archive")
+                    : tr("incrément n° \(step)", "increment #\(step)")]
+                parts.append(L10n.count(copiedFiles, "fichier envoyé", "fichiers envoyés", "file uploaded", "files uploaded"))
+                if let deleted = deletedItems, deleted > 0 {
+                    parts.append(L10n.count(deleted, "supprimé", "supprimés", "deleted", "deleted"))
+                }
+                if copiedBytes > 0 { parts.append(L10n.bytes(copiedBytes)) }
+                return parts.joined(separator: "  ·  ")
             }
             guard let files = sourceFiles else { return summary }
             var parts = [L10n.count(files, "fichier", "fichiers", "file", "files")]

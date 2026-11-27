@@ -46,6 +46,28 @@ final class BackupController: ObservableObject {
     @Published private(set) var isRunning = false
     @Published private(set) var progress: SyncProgress?
 
+    // Sauvegarde iCloud (archive chiffrée, incrémentale)
+    @Published var iCloudEnabled = false {
+        didSet { UserDefaults.standard.set(iCloudEnabled, forKey: Self.iCloudEnabledKey) }
+    }
+    /// Dossier choisi dans iCloud Drive ; chaque élément y a son sous-dossier.
+    @Published var iCloudFolder: URL? {
+        didSet { UserDefaults.standard.set(iCloudFolder?.path, forKey: Self.iCloudFolderKey) }
+    }
+    @Published private(set) var hasICloudPassword = false
+    /// Éléments dont la prochaine sauvegarde iCloud repartira d'une archive complète.
+    @Published private(set) var pendingFullArchive: Set<String> = [] {
+        didSet { UserDefaults.standard.set(pendingFullArchive.sorted(), forKey: Self.pendingFullKey) }
+    }
+    /// Vrai après un changement de mot de passe : la nouvelle archive complète est obligatoire
+    /// (une chaîne ne doit jamais mélanger deux mots de passe).
+    @Published private(set) var fullArchiveRequired = false {
+        didSet { UserDefaults.standard.set(fullArchiveRequired, forKey: Self.fullRequiredKey) }
+    }
+    @Published var showICloudSettings = false
+    /// Avancement de la ligne iCloud en cours.
+    @Published private(set) var cloudProgress: CloudProgress?
+
     /// Avertissements à confirmer avant de lancer la sauvegarde.
     @Published var confirmation: [String] = []
     @Published var showConfirmation = false
@@ -54,6 +76,10 @@ final class BackupController: ObservableObject {
     private static let destinationKey = "destinationPath"
     private static let selectionKey = "selectedSources"
     private static let languageKey = "appLanguage"
+    private static let iCloudEnabledKey = "iCloudEnabled"
+    private static let iCloudFolderKey = "iCloudFolderPath"
+    private static let pendingFullKey = "iCloudPendingFullArchive"
+    private static let fullRequiredKey = "iCloudFullArchiveRequired"
     private let historyStore = HistoryStore.default
     /// Écritures de l'historique, en arrière-plan et dans l'ordre.
     private let historyQueue = DispatchQueue(label: "com.cepe.sauvegarde-mac.history", qos: .utility)
@@ -83,6 +109,12 @@ final class BackupController: ObservableObject {
         } else {
             selection = Set(BackupSource.all.filter(\.isDefault).map(\.id))
         }
+        iCloudEnabled = UserDefaults.standard.bool(forKey: Self.iCloudEnabledKey)
+        iCloudFolder = UserDefaults.standard.string(forKey: Self.iCloudFolderKey)
+            .map { URL(fileURLWithPath: $0, isDirectory: true) }
+        pendingFullArchive = Set(UserDefaults.standard.stringArray(forKey: Self.pendingFullKey) ?? [])
+        fullArchiveRequired = UserDefaults.standard.bool(forKey: Self.fullRequiredKey) && !pendingFullArchive.isEmpty
+        hasICloudPassword = PasswordKeychain.exists()
         let loaded = historyStore.loadReportingProblems()
         history = loaded.runs
         run = history.first
@@ -174,24 +206,36 @@ final class BackupController: ObservableObject {
 
     func requestStart() {
         guard !isRunning else { return }
-        guard let destination else {
-            errorMessage = tr("Cliquez sur « Choisir… » pour sélectionner un dossier de destination.",
-                              "Click “Choose…” to select a destination folder.")
-            return
-        }
-        guard FileManager.default.fileExists(atPath: destination.path) else {
-            errorMessage = tr("Le dossier de destination est introuvable :\n\(destination.path)\n\nLe disque externe est-il branché ?",
-                              "The destination folder cannot be found:\n\(destination.path)\n\nIs the external disk connected?")
-            return
-        }
         let selected = selectedSources
         guard !selected.isEmpty else {
             errorMessage = tr("Sélectionnez au moins un élément à sauvegarder.", "Select at least one item to back up.")
             return
         }
+        let diskReady = destination.map { FileManager.default.fileExists(atPath: $0.path) } ?? false
+        if iCloudEnabled {
+            if let problem = iCloudProblem {
+                errorMessage = problem
+                return
+            }
+        } else {
+            guard let destination else {
+                errorMessage = tr("Cliquez sur « Choisir… » pour sélectionner un dossier de destination.",
+                                  "Click “Choose…” to select a destination folder.")
+                return
+            }
+            guard diskReady else {
+                errorMessage = tr("Le dossier de destination est introuvable :\n\(destination.path)\n\nLe disque externe est-il branché ?",
+                                  "The destination folder cannot be found:\n\(destination.path)\n\nIs the external disk connected?")
+                return
+            }
+        }
 
         refresh()
         var warnings: [String] = []
+        if iCloudEnabled, !diskReady {
+            warnings.append(tr("Disque externe non connecté : seule la sauvegarde iCloud sera faite.",
+                               "External disk not connected: only the iCloud backup will run."))
+        }
         let open = selected.flatMap { runningApps[$0.id] ?? [] }
         if !open.isEmpty {
             let names = open.joined(separator: ", ")
@@ -204,9 +248,15 @@ final class BackupController: ObservableObject {
             warnings.append(tr("Accès refusé : \(names). Accordez l'accès complet au disque à MY SIMPLE BACKUP dans Réglages Système › Confidentialité et sécurité.",
                                "Access denied: \(names). Grant Full Disk Access to MY SIMPLE BACKUP in System Settings › Privacy & Security."))
         }
-        if deleteExtraneous {
+        if deleteExtraneous, diskReady {
             warnings.append(tr("Mode suppression activé : les fichiers présents dans la destination mais absents de votre Mac seront définitivement supprimés.",
                                "Deletion mode enabled: files in the destination that are no longer on your Mac will be permanently deleted."))
+        }
+        let resets = selected.filter { pendingFullArchive.contains($0.id) }.map(\.label)
+        if iCloudEnabled, !resets.isEmpty {
+            let names = resets.joined(separator: ", ")
+            warnings.append(tr("iCloud repartira d'une archive complète pour : \(names). Tout sera renvoyé ; les anciennes archives seront supprimées une fois la nouvelle terminée.",
+                               "iCloud will start over from a full archive for: \(names). Everything will be uploaded again; the old archives will be deleted once the new one is complete."))
         }
 
         if warnings.isEmpty {
@@ -218,9 +268,28 @@ final class BackupController: ObservableObject {
     }
 
     func start() {
-        guard !isRunning, let destination else { return }
+        guard !isRunning else { return }
         let sources = selectedSources
         let delete = deleteExtraneous
+        let disk = destination.flatMap { FileManager.default.fileExists(atPath: $0.path) ? $0 : nil }
+        var cloud: CloudPlan?
+        if iCloudEnabled, let folder = iCloudFolder {
+            do {
+                guard let password = try PasswordKeychain.read(), !password.isEmpty else {
+                    hasICloudPassword = false
+                    errorMessage = tr("Mot de passe des archives iCloud introuvable dans le trousseau : définissez-le dans Réglages iCloud…",
+                                      "iCloud archive password not found in the keychain: set it in iCloud Settings…")
+                    return
+                }
+                cloud = CloudPlan(folder: folder, password: password, startNew: pendingFullArchive)
+            } catch {
+                errorMessage = error.localizedDescription
+                return
+            }
+        }
+        guard disk != nil || cloud != nil else { return }
+        // Constante : Swift 5.9 refuse de capturer une `var` dans la tâche détachée.
+        let cloudPlan = cloud
 
         isRunning = true
         progress = nil
@@ -234,8 +303,8 @@ final class BackupController: ObservableObject {
 
         let controller = self
         job = Task.detached(priority: .userInitiated) {
-            await BackupController.perform(sources: sources, destination: destination, delete: delete,
-                                           cancel: flag, controller: controller)
+            await BackupController.perform(sources: sources, destination: disk, delete: delete,
+                                           cloud: cloudPlan, cancel: flag, controller: controller)
             await controller.backupEnded()
         }
     }
@@ -245,6 +314,7 @@ final class BackupController: ObservableObject {
         activity = nil
         isRunning = false
         progress = nil
+        cloudProgress = nil
         progressSourceID = nil
         job = nil
         cancelFlag = nil
@@ -296,17 +366,48 @@ final class BackupController: ObservableObject {
 
     // MARK: - Exécution (hors thread principal)
 
+    /// Paramètres de la partie iCloud d'une sauvegarde.
+    struct CloudPlan {
+        let folder: URL
+        let password: String
+        /// Éléments à faire repartir d'une archive complète.
+        let startNew: Set<String>
+    }
+
     private nonisolated static func perform(
-        sources: [BackupSource], destination: URL, delete: Bool,
+        sources: [BackupSource], destination: URL?, delete: Bool, cloud: CloudPlan?,
         cancel: CancellationFlag, controller: BackupController
     ) async {
+        var rows: [SourceReport] = []
+        if destination != nil {
+            rows += sources.map { SourceReport(id: $0.id, label: $0.label, symbol: $0.symbol) }
+        }
+        if cloud != nil {
+            rows += sources.map { SourceReport(id: SourceReport.cloudPrefix + $0.id, label: $0.label, symbol: "icloud.fill") }
+        }
         await controller.beginRun(RunReport(
             startedAt: Date(),
-            destination: destination,
-            deleteMode: delete,
-            sources: sources.map { SourceReport(id: $0.id, label: $0.label, symbol: $0.symbol) }
+            destination: destination ?? cloud?.folder ?? URL(fileURLWithPath: "/"),
+            deleteMode: delete && destination != nil,
+            sources: rows
         ))
 
+        var interruption: String?
+        if let destination {
+            interruption = await performDisk(sources: sources, destination: destination, delete: delete,
+                                             cancel: cancel, controller: controller)
+        }
+        if let cloud, !cancel.isCancelled {
+            await performCloud(sources: sources, plan: cloud, cancel: cancel, controller: controller)
+        }
+        await controller.finishRun(cancelled: cancel.isCancelled, interruption: interruption)
+    }
+
+    /// Copie vers le disque externe. Renvoie le message à afficher si le disque a été débranché.
+    private nonisolated static func performDisk(
+        sources: [BackupSource], destination: URL, delete: Bool,
+        cancel: CancellationFlag, controller: BackupController
+    ) async -> String? {
         let engine = SyncEngine()
         var interruption: String?
         for source in sources {
@@ -358,8 +459,70 @@ final class BackupController: ObservableObject {
             }
             if interruption != nil { break }
         }
+        return interruption
+    }
 
-        await controller.finishRun(cancelled: cancel.isCancelled, interruption: interruption)
+    /// Envoi vers iCloud : une étape de chaîne chiffrée par dossier, et la liste des applications
+    /// en clair. Chaque ligne n'est terminée qu'une fois tout envoyé vers iCloud.
+    private nonisolated static func performCloud(
+        sources: [BackupSource], plan: CloudPlan, cancel: CancellationFlag, controller: BackupController
+    ) async {
+        let uploader = ICloudUploadQueue(
+            isCancelled: { cancel.isCancelled },
+            onStatus: { status in Task { @MainActor in controller.updateCloudUpload(status) } })
+        for source in sources {
+            if cancel.isCancelled { break }
+            let rowID = SourceReport.cloudPrefix + source.id
+            await controller.beginSource(rowID)
+
+            switch source.kind {
+            case .appList:
+                do {
+                    let count = try await onDedicatedThread(qos: .userInitiated) { () throws -> Int in
+                        let apps = AppInventory.scan()
+                        let file = plan.folder.appendingPathComponent(AppInventory.fileName)
+                        try FileManager.default.createDirectory(at: plan.folder, withIntermediateDirectories: true)
+                        try AppInventory.report(apps).write(to: file, atomically: true, encoding: .utf8)
+                        let size = (try? FileManager.default.attributesOfItem(atPath: file.path)[.size] as? NSNumber)?
+                            .int64Value ?? 0
+                        uploader.enqueue(file, size: size, evict: false)
+                        try uploader.waitUntilEmpty()
+                        return apps.count
+                    }
+                    await controller.finishSource(rowID, status: .success, applicationCount: count)
+                } catch {
+                    await controller.finishCloudFailure(rowID, error: error, cancelled: cancel.isCancelled)
+                }
+
+            case .folder(let url):
+                let sourceID = source.id
+                let fullRequested = plan.startNew.contains(sourceID)
+                let backup = ICloudChainBackup(
+                    source: url,
+                    destination: plan.folder.appendingPathComponent(url.lastPathComponent, isDirectory: true),
+                    cacheFile: cloudCacheFile(for: sourceID),
+                    password: plan.password,
+                    uploader: uploader,
+                    fetch: { try ICloudDrive.download($0, isCancelled: { cancel.isCancelled }) })
+                do {
+                    let outcome = try await onDedicatedThread(qos: .userInitiated) {
+                        try backup.run(startNewChain: fullRequested, isCancelled: { cancel.isCancelled },
+                                       progress: { p in Task { @MainActor in controller.updateCloudPhase(p, for: rowID) } })
+                    }
+                    await controller.finishCloudSource(rowID, sourceID: sourceID, outcome: outcome,
+                                                       fullRequested: fullRequested)
+                } catch {
+                    await controller.finishCloudFailure(rowID, error: error, cancelled: cancel.isCancelled)
+                }
+            }
+        }
+    }
+
+    /// État mémorisé localement de la chaîne iCloud d'un élément (hors iCloud).
+    private nonisolated static func cloudCacheFile(for sourceID: String) -> URL {
+        let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support")
+        return support.appendingPathComponent("com.cepe.sauvegarde-mac/icloud/\(sourceID).json")
     }
 
     private nonisolated static func disconnectedMessage() -> String {
@@ -375,6 +538,7 @@ final class BackupController: ObservableObject {
 
     private func beginSource(_ id: String) {
         progress = nil
+        cloudProgress = nil
         progressSourceID = id
         guard let i = run?.sources.firstIndex(where: { $0.id == id }) else { return }
         run?.sources[i].status = .running
@@ -407,6 +571,143 @@ final class BackupController: ObservableObject {
         }
         report.finishedAt = Date()
         run?.sources[i] = report
+    }
+
+    // MARK: - iCloud (thread principal)
+
+    private func updateCloudPhase(_ phase: ICloudChainBackup.Progress, for id: String) {
+        guard isRunning, id == progressSourceID else { return }
+        var current = cloudProgress ?? CloudProgress()
+        current.phase = phase.phase
+        current.partsWritten = phase.partsWritten
+        current.bytesToArchive = phase.bytesToArchive
+        cloudProgress = current
+    }
+
+    private func updateCloudUpload(_ status: ICloudUploadQueue.Status) {
+        guard isRunning, progressSourceID?.hasPrefix(SourceReport.cloudPrefix) == true else { return }
+        var current = cloudProgress ?? CloudProgress()
+        current.uploadedBytes = status.uploadedBytes
+        current.pendingBytes = status.pendingBytes
+        current.waitingForICloud = status.waitingForICloud
+        cloudProgress = current
+    }
+
+    private func finishCloudSource(_ rowID: String, sourceID: String, outcome: ICloudChainBackup.Outcome,
+                                   fullRequested: Bool) {
+        cloudProgress = nil
+        guard var report = run?.sources.first(where: { $0.id == rowID }),
+              let i = run?.sources.firstIndex(where: { $0.id == rowID }) else { return }
+        report.status = outcome.issues.isEmpty ? .success : .warning
+        report.issues = outcome.issues.map(\.description)
+        report.issueCount = outcome.issues.count
+        report.sourceFiles = outcome.sourceFiles
+        report.copiedFiles = outcome.changedFiles
+        report.copiedBytes = outcome.changedBytes
+        report.deletedItems = outcome.deletedItems
+        report.cloudStep = outcome.step
+        report.cloudFull = outcome.kind == .complete
+        report.finishedAt = Date()
+        run?.sources[i] = report
+        if fullRequested, outcome.step == 0 {
+            pendingFullArchive.remove(sourceID)
+            if pendingFullArchive.isEmpty { fullArchiveRequired = false }
+        }
+    }
+
+    private func finishCloudFailure(_ rowID: String, error: Error, cancelled: Bool) {
+        cloudProgress = nil
+        if cancelled {
+            finishSource(rowID, status: .cancelled)
+        } else {
+            finishSource(rowID, status: .failed, message: error.localizedDescription)
+        }
+    }
+
+    // MARK: - Réglages iCloud
+
+    /// Problème empêchant la sauvegarde iCloud, ou `nil` si elle est prête.
+    var iCloudProblem: String? {
+        if !ICloudDrive.isAvailable {
+            return tr("iCloud Drive n'est pas activé sur ce Mac (Réglages Système › votre nom › iCloud).",
+                      "iCloud Drive is not enabled on this Mac (System Settings › your name › iCloud).")
+        }
+        guard let folder = iCloudFolder, ICloudDrive.contains(folder) else {
+            return tr("Choisissez le dossier de sauvegarde dans iCloud Drive (Réglages iCloud…).",
+                      "Choose the backup folder in iCloud Drive (iCloud Settings…).")
+        }
+        if !hasICloudPassword {
+            return tr("Définissez le mot de passe des archives (Réglages iCloud…).",
+                      "Set the archive password (iCloud Settings…).")
+        }
+        return nil
+    }
+
+    /// Chemin du dossier iCloud tel que le Finder l'affiche (« iCloud Drive › MY SIMPLE BACKUP »).
+    var iCloudFolderDisplay: String? {
+        guard let folder = iCloudFolder else { return nil }
+        let root = ICloudDrive.rootURL.standardizedFileURL.path
+        let path = folder.standardizedFileURL.path
+        guard path.hasPrefix(root) else { return folder.path }
+        let rest = path.dropFirst(root.count).split(separator: "/").joined(separator: " › ")
+        return rest.isEmpty ? "iCloud Drive" : "iCloud Drive › " + rest
+    }
+
+    func chooseICloudFolder() {
+        guard ICloudDrive.isAvailable else {
+            errorMessage = iCloudProblem
+            return
+        }
+        let panel = NSOpenPanel()
+        panel.title = tr("Choisir le dossier de sauvegarde dans iCloud Drive", "Choose the backup folder in iCloud Drive")
+        panel.prompt = tr("Choisir", "Choose")
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.canCreateDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.directoryURL = iCloudFolder ?? ICloudDrive.rootURL
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        guard ICloudDrive.contains(url) else {
+            errorMessage = tr("Ce dossier n'est pas dans iCloud Drive. Choisissez un dossier dans iCloud Drive.",
+                              "This folder is not in iCloud Drive. Choose a folder in iCloud Drive.")
+            return
+        }
+        iCloudFolder = url
+    }
+
+    /// Enregistre le mot de passe dans le trousseau.
+    /// - Returns: un message d'erreur, ou `nil` si c'est fait.
+    func setICloudPassword(_ password: String, confirmation: String) -> String? {
+        guard password.count >= 8 else {
+            return tr("Le mot de passe doit contenir au moins 8 caractères.", "The password must be at least 8 characters long.")
+        }
+        guard password == confirmation else {
+            return tr("Les deux mots de passe ne sont pas identiques.", "The two passwords do not match.")
+        }
+        let replacing = hasICloudPassword
+        do {
+            try PasswordKeychain.save(password)
+        } catch {
+            return error.localizedDescription
+        }
+        hasICloudPassword = true
+        // Les archives existantes restent chiffrées avec l'ancien mot de passe : nouvelle chaîne,
+        // obligatoire (on ne mélange jamais deux mots de passe dans une chaîne).
+        if replacing {
+            requestFullArchive()
+            fullArchiveRequired = true
+        }
+        return nil
+    }
+
+    /// La prochaine sauvegarde iCloud de chaque dossier repartira d'une archive complète.
+    func requestFullArchive() {
+        pendingFullArchive = Set(BackupSource.all.filter { $0.folderURL != nil }.map(\.id))
+    }
+
+    func cancelFullArchiveRequest() {
+        guard !fullArchiveRequired else { return }
+        pendingFullArchive = []
     }
 
     private func finishRun(cancelled: Bool, interruption: String?) {
@@ -468,4 +769,14 @@ final class BackupController: ObservableObject {
     func flushHistory() {
         historyQueue.sync {}
     }
+}
+
+/// Avancement de la ligne iCloud en cours (phase de l'étape + état de la file d'envoi).
+struct CloudProgress: Equatable {
+    var phase: ICloudChainBackup.Phase = .scanning
+    var partsWritten = 0
+    var bytesToArchive: Int64 = 0
+    var uploadedBytes: Int64 = 0
+    var pendingBytes: Int64 = 0
+    var waitingForICloud = false
 }
