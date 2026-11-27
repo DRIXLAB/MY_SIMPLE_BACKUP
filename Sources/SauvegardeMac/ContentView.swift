@@ -42,6 +42,9 @@ struct ContentView: View {
         .sheet(isPresented: $controller.showICloudSettings) {
             ICloudSettingsView(controller: controller)
         }
+        .sheet(isPresented: $controller.showRestore) {
+            RestoreView(controller: controller)
+        }
     }
 
     // MARK: Langue
@@ -207,6 +210,7 @@ struct ContentView: View {
                            isOn: $controller.iCloudEnabled)
                         .toggleStyle(.checkbox)
                     Spacer()
+                    Button(tr("Restaurer…", "Restore…")) { controller.showRestore = true }
                     Button(tr("Réglages…", "Settings…")) { controller.showICloudSettings = true }
                 }
                 if controller.iCloudEnabled {

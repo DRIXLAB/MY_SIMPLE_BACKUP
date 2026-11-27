@@ -65,6 +65,9 @@ final class BackupController: ObservableObject {
         didSet { UserDefaults.standard.set(fullArchiveRequired, forKey: Self.fullRequiredKey) }
     }
     @Published var showICloudSettings = false
+    @Published var showRestore = false
+    /// Restauration iCloud en cours (feuille « Restaurer »), pour la confirmation avant de quitter.
+    var isRestoring = false
     /// Avancement de la ligne iCloud en cours.
     @Published private(set) var cloudProgress: CloudProgress?
 
@@ -342,6 +345,16 @@ final class BackupController: ObservableObject {
 
     /// Réponse à ⌘Q : pendant une sauvegarde, confirmation puis arrêt propre avant de quitter.
     func shouldTerminate() -> NSApplication.TerminateReply {
+        if !isRunning, isRestoring {
+            let alert = NSAlert()
+            alert.alertStyle = .warning
+            alert.messageText = tr("Une restauration est en cours", "A restore is in progress")
+            alert.informativeText = tr("Quitter maintenant l'interrompt : le dossier de restauration restera incomplet.",
+                                       "Quitting now interrupts it: the restore folder will be incomplete.")
+            alert.addButton(withTitle: tr("Continuer la restauration", "Continue restore"))
+            alert.addButton(withTitle: tr("Quitter", "Quit"))
+            guard alert.runModal() == .alertSecondButtonReturn else { return .terminateCancel }
+        }
         guard isRunning else {
             flushHistory()
             return .terminateNow

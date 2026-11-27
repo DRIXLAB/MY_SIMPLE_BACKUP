@@ -296,6 +296,28 @@ public enum EncryptedArchive {
         }
     }
 
+    /// Lecture morceau par morceau (restauration) : la clé est dérivée une seule fois, et chaque
+    /// morceau, indépendant, peut être lu, ignoré s'il est abîmé, puis libéré.
+    public struct Reader {
+        /// Morceaux de l'archive, dans l'ordre (sous leur nom réel).
+        public let parts: [URL]
+        private let key: SymmetricKey
+
+        /// - Parameter beforeReading: appelé pour `cle.json` (par exemple pour le télécharger).
+        public init(partsDirectory: URL, password: String, beforeReading: (URL) throws -> Void = { _ in }) throws {
+            parts = try EncryptedArchive.parts(in: partsDirectory)
+            try beforeReading(partsDirectory.appendingPathComponent(EncryptedArchive.keyFileName))
+            key = try EncryptedArchive.deriveKey(password: password,
+                                                 parameters: try EncryptedArchive.readKeyParameters(in: partsDirectory))
+        }
+
+        /// Déchiffre et extrait un morceau dans `destination` (créé si besoin).
+        public func extract(_ part: URL, to destination: URL) throws {
+            try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+            try EncryptedArchive.extractPart(part, to: destination, key: key)
+        }
+    }
+
     private static func extractPart(_ part: URL, to destination: URL, key: SymmetricKey) throws {
         let name = part.lastPathComponent
         let damaged = Failure.wrongPasswordOrDamaged(name)
