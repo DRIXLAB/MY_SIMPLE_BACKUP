@@ -117,5 +117,35 @@ final class EncryptedArchiveTests: XCTestCase {
         }
         XCTAssertEqual((try? EncryptedArchive.parts(in: parts)) ?? [], [])
     }
+
+    func testKeyParametersAreWrittenAndSaltIsRandom() throws {
+        let other = root.appendingPathComponent("autres-morceaux")
+        try EncryptedArchive.create(from: source, to: parts, password: "secret", partSize: partSize)
+        try EncryptedArchive.create(from: source, to: other, password: "secret", partSize: partSize)
+        let first = try EncryptedArchive.readKeyParameters(in: parts)
+        let second = try EncryptedArchive.readKeyParameters(in: other)
+        XCTAssertEqual(first.iterations, EncryptedArchive.defaultIterations)
+        XCTAssertEqual(first.salt.count, 16)
+        XCTAssertNotEqual(first.salt, second.salt)
+        // Le fichier de clé ne fait pas partie des morceaux.
+        XCTAssertFalse(try EncryptedArchive.parts(in: parts).contains { $0.lastPathComponent == EncryptedArchive.keyFileName })
+    }
+
+    func testKeyDerivationIsDeterministic() throws {
+        let parameters = EncryptedArchive.KeyParameters(iterations: 1000, salt: Data(repeating: 7, count: 16))
+        let a = try EncryptedArchive.deriveKey(password: "secret", parameters: parameters)
+        let b = try EncryptedArchive.deriveKey(password: "secret", parameters: parameters)
+        let c = try EncryptedArchive.deriveKey(password: "autre", parameters: parameters)
+        XCTAssertEqual(a, b)
+        XCTAssertNotEqual(a, c)
+    }
+
+    func testMissingKeyFileIsDetected() throws {
+        try EncryptedArchive.create(from: source, to: parts, password: "secret", partSize: partSize)
+        try fm.removeItem(at: parts.appendingPathComponent(EncryptedArchive.keyFileName))
+        XCTAssertThrowsError(try EncryptedArchive.extract(from: parts, to: restored, password: "secret")) { error in
+            XCTAssertEqual(error as? EncryptedArchive.Failure, .unreadableArchive)
+        }
+    }
 }
 #endif

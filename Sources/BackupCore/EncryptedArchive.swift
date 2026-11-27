@@ -1,10 +1,18 @@
 #if canImport(AppleArchive)
 import AppleArchive
+import CommonCrypto
+import CryptoKit
 import Foundation
 import System
 
-/// Archive Apple Archive compressée (LZFSE) et chiffrée par mot de passe (AEA, AES-256),
-/// écrite et relue **au fil de l'eau** et découpée en morceaux (`archive.aea.0001`, `.0002`…).
+/// Archive Apple Archive compressée (LZFSE) et chiffrée (AEA, AES-256), écrite et relue
+/// **au fil de l'eau** et découpée en morceaux (`archive.aea.0001`, `.0002`…).
+///
+/// Chiffrement : le profil AEA « mot de passe » (scrypt) refuse le mot de passe sur macOS 13
+/// (`setPassword` échoue ; il ne fonctionne qu'à partir de macOS 14). On utilise donc le profil à
+/// clé symétrique (macOS 12+), avec une clé de 256 bits **dérivée du mot de passe** par
+/// PBKDF2-HMAC-SHA256 (CommonCrypto). Le sel aléatoire et le nombre d'itérations sont écrits en
+/// clair dans `cle.json` à côté des morceaux : ils ne sont pas secrets, mais indispensables.
 ///
 /// Écriture : Apple Archive écrit dans un flux personnalisé (`PartedSink`) qui répartit les octets
 /// en morceaux de `partSize`. Le chiffrement AEA réécrit son en-tête (« prologue ») **à la fin**, à
@@ -21,6 +29,47 @@ import System
 /// macOS uniquement (Apple Archive) ; testé par `EncryptedArchiveTests` sur Mac.
 public enum EncryptedArchive {
     public static let partPrefix = "archive.aea."
+    /// Paramètres de dérivation de la clé (non secrets), à côté des morceaux.
+    public static let keyFileName = "cle.json"
+    /// Itérations PBKDF2 (recommandation OWASP pour HMAC-SHA256).
+    public static let defaultIterations = 600_000
+
+    struct KeyParameters: Codable, Equatable {
+        var algorithm = "PBKDF2-HMAC-SHA256"
+        var iterations: Int
+        var salt: Data
+    }
+
+    /// Clé AES-256 dérivée du mot de passe.
+    static func deriveKey(password: String, parameters: KeyParameters) throws -> SymmetricKey {
+        guard parameters.algorithm == "PBKDF2-HMAC-SHA256", parameters.iterations > 0 else {
+            throw Failure.unreadableArchive
+        }
+        var derived = [UInt8](repeating: 0, count: 32)
+        let status = parameters.salt.withUnsafeBytes { salt in
+            CCKeyDerivationPBKDF(CCPBKDFAlgorithm(kCCPBKDF2),
+                                 password, password.utf8.count,
+                                 salt.bindMemory(to: UInt8.self).baseAddress, salt.count,
+                                 CCPseudoRandomAlgorithm(kCCPRFHmacAlgSHA256),
+                                 UInt32(parameters.iterations),
+                                 &derived, derived.count)
+        }
+        guard Int(status) == kCCSuccess else { throw Failure.cannotCreateStream("key") }
+        return SymmetricKey(data: derived)
+    }
+
+    static func writeKeyParameters(_ parameters: KeyParameters, in directory: URL) throws {
+        let data = try JSONEncoder().encode(parameters)
+        try data.write(to: directory.appendingPathComponent(keyFileName), options: .atomic)
+    }
+
+    static func readKeyParameters(in directory: URL) throws -> KeyParameters {
+        guard let data = try? Data(contentsOf: directory.appendingPathComponent(keyFileName)),
+              let parameters = try? JSONDecoder().decode(KeyParameters.self, from: data) else {
+            throw Failure.unreadableArchive
+        }
+        return parameters
+    }
 
     public enum Failure: Error, Equatable, LocalizedError {
         case cannotCreateStream(String)
@@ -68,18 +117,26 @@ public enum EncryptedArchive {
         to partsDirectory: URL,
         password: String,
         partSize: Int64 = 1 << 30,
+        iterations: Int = defaultIterations,
         beforeNewPart: @escaping () throws -> Void = {},
         onPartCompleted: @escaping (URL, Int64) -> Void = { _, _ in },
         isCancelled: @escaping () -> Bool = { false }
     ) throws -> [URL] {
         try FileManager.default.createDirectory(at: partsDirectory, withIntermediateDirectories: true)
+        var salt = Data(count: 16)
+        salt.withUnsafeMutableBytes { arc4random_buf($0.baseAddress!, $0.count) }
+        let parameters = KeyParameters(iterations: iterations, salt: salt)
+        let key = try deriveKey(password: password, parameters: parameters)
+        try writeKeyParameters(parameters, in: partsDirectory)
+
         let sink = PartedSink(directory: partsDirectory, partSize: partSize, beforeNewPart: beforeNewPart,
                               onPartCompleted: onPartCompleted, isCancelled: isCancelled)
         do {
-            try writeArchive(of: sourceDirectory, to: sink, password: password)
+            try writeArchive(of: sourceDirectory, to: sink, key: key)
             return try sink.finish()
         } catch {
             sink.abandon()
+            try? FileManager.default.removeItem(at: partsDirectory.appendingPathComponent(keyFileName))
             // Une erreur levée par le flux (annulation, crochet) prime sur celle d'Apple Archive.
             if let failure = sink.failure { throw failure }
             throw (error as? Failure) ?? Failure.io(error.localizedDescription)
@@ -88,17 +145,17 @@ public enum EncryptedArchive {
 
     /// Fermetures explicites et dans l'ordre (archive, chiffrement, flux) : une erreur lors de
     /// l'écriture finale doit remonter, sinon l'archive serait tronquée sans avertissement.
-    private static func writeArchive(of sourceDirectory: URL, to sink: PartedSink, password: String) throws {
+    private static func writeArchive(of sourceDirectory: URL, to sink: PartedSink, key: SymmetricKey) throws {
         guard let output = ArchiveByteStream.customStream(instance: sink) else {
             throw Failure.cannotCreateStream("output")
         }
-        let context = ArchiveEncryptionContext(profile: .hkdf_sha256_aesctr_hmac__scrypt__none,
+        let context = ArchiveEncryptionContext(profile: .hkdf_sha256_aesctr_hmac__symmetric__none,
                                                compressionAlgorithm: .lzfse)
         do {
-            try context.setPassword(password)
+            try context.setSymmetricKey(key)
         } catch {
             try? output.close()
-            throw Failure.cannotCreateStream("password")
+            throw Failure.cannotCreateStream("key")
         }
         guard let encryptionStream = ArchiveByteStream.encryptionStream(writingTo: output,
                                                                         encryptionContext: context) else {
@@ -151,6 +208,7 @@ public enum EncryptedArchive {
         isCancelled: @escaping () -> Bool = { false }
     ) throws {
         let partURLs = try parts(in: partsDirectory)
+        let key = try deriveKey(password: password, parameters: try readKeyParameters(in: partsDirectory))
         try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
         let (readEnd, writeEnd) = try makePipe()
 
@@ -167,7 +225,7 @@ public enum EncryptedArchive {
 
         var archiveError: Error?
         do {
-            try readArchive(fromDescriptor: readEnd, to: destination, password: password)
+            try readArchive(fromDescriptor: readEnd, to: destination, key: key)
         } catch {
             archiveError = error
         }
@@ -179,7 +237,7 @@ public enum EncryptedArchive {
         }
     }
 
-    private static func readArchive(fromDescriptor fd: Int32, to destination: URL, password: String) throws {
+    private static func readArchive(fromDescriptor fd: Int32, to destination: URL, key: SymmetricKey) throws {
         guard let fileStream = ArchiveByteStream.fileStream(fd: FileDescriptor(rawValue: fd), automaticClose: true) else {
             close(fd)
             throw Failure.cannotCreateStream("fd")
@@ -188,7 +246,7 @@ public enum EncryptedArchive {
             try? fileStream.close()
             throw Failure.unreadableArchive
         }
-        guard (try? context.setPassword(password)) != nil,
+        guard (try? context.setSymmetricKey(key)) != nil,
               let decryptionStream = ArchiveByteStream.decryptionStream(readingFrom: fileStream,
                                                                         encryptionContext: context) else {
             try? fileStream.close()
