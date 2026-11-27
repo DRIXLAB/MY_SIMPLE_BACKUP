@@ -218,49 +218,47 @@ public enum EncryptedArchive {
         return issues
     }
 
-    /// Fermetures explicites et dans l'ordre (archive, chiffrement, fichier) : une erreur lors de
-    /// l'écriture finale doit remonter, sinon le morceau serait tronqué sans avertissement.
+    /// Ouvre un flux, exécute `body`, puis le libère **avant** de rendre la main : en imbriquant
+    /// ces appels, chaque flux est toujours libéré avant le flux dont il dépend.
+    ///
+    /// Indispensable : en cas d'erreur, la désallocation d'un flux Apple Archive le ferme
+    /// (`deinit` → `AAArchiveStreamClose`) ; si le flux dont il dépend a déjà été fermé à la main,
+    /// c'est un plantage (EXC_BAD_ACCESS constaté sur macOS 13 avec un morceau abîmé). On ne ferme
+    /// donc les flux explicitement qu'en cas de succès, du plus interne au plus externe, pour que
+    /// leurs erreurs remontent ; en cas d'échec, on laisse la libération ordonnée s'en charger.
+    private static func scoped<Stream: AnyObject, R>(
+        _ stream: Stream?, orThrow failure: @autoclosure () -> Error, _ body: (Stream) throws -> R
+    ) throws -> R {
+        guard let stream else { throw failure() }
+        return try body(stream)
+    }
+
     private static func writeArchive(of directory: URL, to file: URL, key: SymmetricKey) throws {
-        guard let fileStream = ArchiveByteStream.fileStream(path: FilePath(file.path), mode: .writeOnly,
-                                                            options: [.create, .truncate],
-                                                            permissions: FilePermissions(rawValue: 0o644)) else {
-            throw Failure.cannotCreateStream("file")
-        }
         let context = ArchiveEncryptionContext(profile: .hkdf_sha256_aesctr_hmac__symmetric__none,
                                                compressionAlgorithm: .lzfse)
         do {
             try context.setSymmetricKey(key)
         } catch {
-            try? fileStream.close()
             throw Failure.cannotCreateStream("key")
         }
-        guard let encryptionStream = ArchiveByteStream.encryptionStream(writingTo: fileStream,
-                                                                        encryptionContext: context) else {
-            try? fileStream.close()
-            throw Failure.cannotCreateStream("encryption")
+        guard let keySet = ArchiveHeader.FieldKeySet(fieldKeys) else {
+            throw Failure.cannotCreateStream("keys")
         }
-        guard let encoder = ArchiveStream.encodeStream(writingTo: encryptionStream),
-              let keySet = ArchiveHeader.FieldKeySet(fieldKeys) else {
-            try? encryptionStream.close()
-            try? fileStream.close()
-            throw Failure.cannotCreateStream("encode")
+        let fileStream = ArchiveByteStream.fileStream(path: FilePath(file.path), mode: .writeOnly,
+                                                      options: [.create, .truncate],
+                                                      permissions: FilePermissions(rawValue: 0o644))
+        try scoped(fileStream, orThrow: Failure.cannotCreateStream("file")) { output in
+            let encryption = ArchiveByteStream.encryptionStream(writingTo: output, encryptionContext: context)
+            try scoped(encryption, orThrow: Failure.cannotCreateStream("encryption")) { encrypted in
+                try scoped(ArchiveStream.encodeStream(writingTo: encrypted),
+                           orThrow: Failure.cannotCreateStream("encode")) { encoder in
+                    try encoder.writeDirectoryContents(archiveFrom: FilePath(directory.path), keySet: keySet)
+                    try encoder.close()
+                }
+                try encrypted.close()
+            }
+            try output.close()
         }
-        do {
-            try encoder.writeDirectoryContents(archiveFrom: FilePath(directory.path), keySet: keySet)
-        } catch {
-            try? encoder.close()
-            try? encryptionStream.close()
-            try? fileStream.close()
-            throw error
-        }
-        do {
-            try encoder.close()
-            try encryptionStream.close()
-        } catch {
-            try? fileStream.close()
-            throw error
-        }
-        try fileStream.close()
     }
 
     // MARK: Relecture
@@ -296,44 +294,32 @@ public enum EncryptedArchive {
 
     private static func extractPart(_ part: URL, to destination: URL, key: SymmetricKey) throws {
         let name = part.lastPathComponent
-        guard let fileStream = ArchiveByteStream.fileStream(path: FilePath(part.path), mode: .readOnly,
-                                                            options: [],
-                                                            permissions: FilePermissions(rawValue: 0o644)) else {
-            throw Failure.io(tr("Lecture impossible de \(name)", "Cannot read \(name)"))
+        let damaged = Failure.wrongPasswordOrDamaged(name)
+        let fileStream = ArchiveByteStream.fileStream(path: FilePath(part.path), mode: .readOnly, options: [],
+                                                      permissions: FilePermissions(rawValue: 0o644))
+        try scoped(fileStream, orThrow: Failure.io(tr("Lecture impossible de \(name)", "Cannot read \(name)"))) { input in
+            guard let context = ArchiveEncryptionContext(from: input),
+                  (try? context.setSymmetricKey(key)) != nil else {
+                throw damaged
+            }
+            let decryption = ArchiveByteStream.decryptionStream(readingFrom: input, encryptionContext: context)
+            try scoped(decryption, orThrow: damaged) { decrypted in
+                try scoped(ArchiveStream.decodeStream(readingFrom: decrypted), orThrow: damaged) { decoder in
+                    try scoped(ArchiveStream.extractStream(extractingTo: FilePath(destination.path)),
+                               orThrow: Failure.cannotCreateStream("extract")) { extractor in
+                        do {
+                            _ = try ArchiveStream.process(readingFrom: decoder, writingTo: extractor)
+                            try extractor.close()
+                        } catch {
+                            throw damaged
+                        }
+                    }
+                    do { try decoder.close() } catch { throw damaged }
+                }
+                do { try decrypted.close() } catch { throw damaged }
+            }
+            try? input.close()
         }
-        guard let context = ArchiveEncryptionContext(from: fileStream) else {
-            try? fileStream.close()
-            throw Failure.wrongPasswordOrDamaged(name)
-        }
-        guard (try? context.setSymmetricKey(key)) != nil,
-              let decryptionStream = ArchiveByteStream.decryptionStream(readingFrom: fileStream,
-                                                                        encryptionContext: context) else {
-            try? fileStream.close()
-            throw Failure.wrongPasswordOrDamaged(name)
-        }
-        guard let decoder = ArchiveStream.decodeStream(readingFrom: decryptionStream) else {
-            try? decryptionStream.close()
-            try? fileStream.close()
-            throw Failure.wrongPasswordOrDamaged(name)
-        }
-        guard let extractor = ArchiveStream.extractStream(extractingTo: FilePath(destination.path)) else {
-            try? decoder.close()
-            try? decryptionStream.close()
-            try? fileStream.close()
-            throw Failure.cannotCreateStream("extract")
-        }
-        var failed = false
-        do {
-            _ = try ArchiveStream.process(readingFrom: decoder, writingTo: extractor)
-        } catch {
-            failed = true
-        }
-        // Toutes les fermetures sont tentées ; la moindre erreur rend la restauration douteuse.
-        if (try? extractor.close()) == nil { failed = true }
-        if (try? decoder.close()) == nil { failed = true }
-        if (try? decryptionStream.close()) == nil { failed = true }
-        try? fileStream.close()
-        if failed { throw Failure.wrongPasswordOrDamaged(name) }
     }
 }
 #endif
