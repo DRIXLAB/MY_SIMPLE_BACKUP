@@ -100,7 +100,9 @@ final class ICloudChainBackupTests: XCTestCase {
     func testIncompleteStepIsRemovedAndNumberReused() throws {
         let first = try backup().run()
         let chain = destination.appendingPathComponent(first.chainName)
-        let orphan = chain.appendingPathComponent(ChainLayout.stepFolderName(step: 1, kind: .increment, date: Date()))
+        // Daté d'une heure plus tôt : un nom différent de la vraie étape 1, créée à la seconde près.
+        let orphan = chain.appendingPathComponent(ChainLayout.stepFolderName(step: 1, kind: .increment,
+                                                                             date: Date().addingTimeInterval(-3600)))
         try fm.createDirectory(at: orphan.appendingPathComponent(ChainLayout.dataFolder), withIntermediateDirectories: true)
 
         try write("a.txt", "alpha modifié", ageSeconds: 60)
