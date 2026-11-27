@@ -135,7 +135,7 @@ fi
 step "3/5  Compilation"
 
 BUILD_LOG="$LOG_DIR/swift-build.log"
-info "swift build -c $CONFIG… 1 à 3 minutes au premier build"
+info "swift build -c ${CONFIG}… 1 à 3 minutes au premier build"
 if ! swift build -c "$CONFIG" --product "$PRODUCT" >"$BUILD_LOG" 2>&1; then
     err "La compilation a échoué. Erreurs :"
     show_errors "$BUILD_LOG"
