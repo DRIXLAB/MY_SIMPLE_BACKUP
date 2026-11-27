@@ -109,13 +109,18 @@ public enum ICloudDrive {
 
     // MARK: Copie locale
 
-    /// Le contenu du fichier est-il présent sur ce Mac ?
+    /// Le contenu du fichier est-il présent sur ce Mac, sous son nom réel ?
+    ///
+    /// Avant macOS 14, un fichier libéré n'existe sur le disque que sous la forme « .nom.icloud » :
+    /// tant que le vrai fichier n'est pas là, il n'est pas téléchargé, même si l'état iCloud est
+    /// momentanément indisponible (pendant le remplacement du fichier caché par le vrai fichier).
     public static func isDownloaded(_ url: URL) -> Bool {
+        guard FileManager.default.fileExists(atPath: url.path) else { return false }
         var fresh = url
         fresh.removeAllCachedResourceValues()
         guard let status = (try? fresh.resourceValues(forKeys: [.ubiquitousItemDownloadingStatusKey]))?
             .ubiquitousItemDownloadingStatus else {
-            // Fichier non géré par iCloud : son contenu est forcément local.
+            // Présent et non géré par iCloud (ou état inconnu) : contenu local.
             return true
         }
         return status == .current || status == .downloaded
