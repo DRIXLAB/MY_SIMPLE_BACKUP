@@ -9,9 +9,10 @@ import System
 ///
 /// Chaque morceau est une archive Apple Archive complète, compressée (LZFSE) et chiffrée (AEA,
 /// AES-256), contenant un lot d'environ `partSize` octets de fichiers (`ArchivePlan.batches`).
-/// Pour chaque lot, un dossier temporaire de **liens physiques** vers les fichiers (aucune copie :
-/// les originaux ne sont jamais modifiés) est archivé, puis supprimé. Avantages : l'espace local
-/// utilisé reste de l'ordre d'un morceau ; un morceau abîmé ne fait perdre que ses fichiers.
+/// Pour chaque lot, un dossier temporaire de **clones** des fichiers (APFS : instantanés et sans
+/// place disque ; les originaux ne sont jamais modifiés, ni même liés) est archivé, puis supprimé.
+/// Avantages : l'espace local utilisé reste de l'ordre d'un morceau ; un morceau abîmé ne fait
+/// perdre que ses fichiers.
 ///
 /// Uniquement des flux fichiers standard (`fileStream(path:)`), comme l'exemple officiel d'Apple :
 /// le chiffrement AEA réécrit son prologue à la fin, à l'offset 0 (un tube est refusé), et le flux
@@ -173,6 +174,11 @@ public enum EncryptedArchive {
     ) throws -> Result {
         let fm = FileManager.default
         let sourcePath = SyncEngine.resolvedPath(sourceDirectory.path)
+        // Jamais d'écriture dans le dossier archivé (ni l'inverse).
+        let partsPath = SyncEngine.resolvedPath(partsDirectory.path)
+        if SyncEngine.pathsOverlap(sourcePath, partsPath) {
+            throw SyncError.overlappingPaths(source: sourcePath, destination: partsPath)
+        }
         let toArchive = try items ?? ArchivePlan.scan(sourceDirectory, isCancelled: isCancelled).items
         try fm.createDirectory(at: partsDirectory, withIntermediateDirectories: true)
 
@@ -182,8 +188,8 @@ public enum EncryptedArchive {
 
         var written: [URL] = []
         var issues: [SyncIssue] = []
-        let staging = fm.temporaryDirectory.appendingPathComponent("msb-lot-\(UUID().uuidString)", isDirectory: true)
-        defer { try? fm.removeItem(at: staging) }
+        let stagingRoot = fm.temporaryDirectory.appendingPathComponent("msb-lot-\(UUID().uuidString)", isDirectory: true)
+        defer { try? fm.removeItem(at: stagingRoot) }
 
         do {
             let batches = ArchivePlan.batches(toArchive, partSize: partSize)
@@ -191,8 +197,10 @@ public enum EncryptedArchive {
                 if isCancelled() { throw Failure.cancelled }
                 try beforeNewPart()
 
-                try? fm.removeItem(at: staging)
+                // Dossier neuf pour chaque lot : rien d'un lot précédent ne peut s'y retrouver.
+                let staging = stagingRoot.appendingPathComponent(String(index + 1), isDirectory: true)
                 try fm.createDirectory(at: staging, withIntermediateDirectories: true)
+                defer { try? fm.removeItem(at: staging) }
                 issues += try stage(batch, from: sourcePath, into: staging, isCancelled: isCancelled)
 
                 let name = partPrefix + String(format: "%04d", index + 1) + partSuffix
@@ -220,9 +228,11 @@ public enum EncryptedArchive {
         }
     }
 
-    /// Reproduit le lot dans `staging` sous forme de liens physiques (clone ou copie en repli,
-    /// par exemple si le dossier temporaire est sur un autre volume). Les originaux ne sont jamais
-    /// ouverts en écriture.
+    /// Reproduit le lot dans `staging`, **sans jamais toucher aux originaux** : chaque fichier y
+    /// est cloné (APFS : instantané, sans place disque, nouvel inode indépendant ; copie classique
+    /// en repli). Pas de lien physique : il modifierait l'original (nombre de liens, date de
+    /// changement d'état, vue comme une modification par Time Machine ou Spotlight) et partagerait
+    /// son contenu. Les originaux ne sont qu'ouverts en lecture.
     static func stage(_ batch: [ArchiveItem], from sourcePath: String, into staging: URL,
                       isCancelled: () -> Bool) throws -> [SyncIssue] {
         let fm = FileManager.default
@@ -242,17 +252,36 @@ public enum EncryptedArchive {
                 }
                 try fm.createSymbolicLink(atPath: target.path, withDestinationPath: destination)
             case .file:
-                if link(source, target.path) == 0 { continue }
-                if errno == ENOENT {
-                    issues.append(SyncIssue(path: item.path, message: tr("disparu depuis l'inventaire", "gone since the scan")))
+                // COPYFILE_CLONE : clone si possible, sinon copie (données, attributs étendus,
+                // droits, dates) ; jamais de lien suivi (COPYFILE_NOFOLLOW_SRC implicite).
+                guard copyfile(source, target.path, nil, copyfile_flags_t(COPYFILE_CLONE)) == 0 else {
+                    let code = errno
+                    issues.append(SyncIssue(path: item.path, message: code == ENOENT
+                        ? tr("disparu depuis l'inventaire", "gone since the scan")
+                        : String(cString: strerror(code))))
+                    try? fm.removeItem(at: target)
                     continue
                 }
-                if copyfile(source, target.path, nil, copyfile_flags_t(COPYFILE_CLONE | COPYFILE_ALL)) != 0 {
-                    issues.append(SyncIssue(path: item.path, message: String(cString: strerror(errno))))
-                }
+                prepareStagedCopy(target.path, of: item)
             }
         }
         return issues
+    }
+
+    /// Ajuste **la copie de travail** (jamais l'original) : sans drapeaux (« verrouillé » dans le
+    /// Finder) ni ACL, qui empêcheraient de la supprimer ; droits sans setuid/setgid/sticky (comme
+    /// la copie vers le disque) ; date de modification de l'inventaire.
+    private static func prepareStagedCopy(_ path: String, of item: ArchiveItem) {
+        _ = chflags(path, 0)
+        if let empty = acl_init(0) {
+            _ = acl_set_file(path, ACL_TYPE_EXTENDED, empty)
+            acl_free(UnsafeMutableRawPointer(empty))
+        }
+        var info = stat()
+        if lstat(path, &info) == 0 {
+            _ = chmod(path, (info.st_mode & 0o777) | S_IRUSR | S_IWUSR)
+        }
+        try? FileManager.default.setAttributes([.modificationDate: item.modificationDate], ofItemAtPath: path)
     }
 
     /// Ouvre un flux, exécute `body`, puis le libère **avant** de rendre la main : en imbriquant

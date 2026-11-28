@@ -68,6 +68,18 @@ public final class SyncEngine {
 
     // MARK: - Utilitaires de chemins (internes, testés)
 
+    /// Vrai si les deux dossiers sont identiques ou imbriqués (liens symboliques résolus,
+    /// casse ignorée).
+    public static func overlaps(_ a: URL, _ b: URL) -> Bool {
+        pathsOverlap(resolvedPath(a.path), resolvedPath(b.path))
+    }
+
+    /// - Throws: `SyncError.overlappingPaths` si les deux dossiers se recouvrent.
+    public static func checkNoOverlap(source: URL, destination: URL) throws {
+        let src = resolvedPath(source.path), dst = resolvedPath(destination.path)
+        if pathsOverlap(src, dst) { throw SyncError.overlappingPaths(source: src, destination: dst) }
+    }
+
     /// Chemin absolu avec liens symboliques résolus, y compris quand la fin du chemin n'existe pas encore.
     static func resolvedPath(_ path: String) -> String {
         var url = URL(fileURLWithPath: path).standardizedFileURL

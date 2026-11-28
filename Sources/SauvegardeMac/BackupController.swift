@@ -661,11 +661,24 @@ final class BackupController: ObservableObject {
             return tr("Choisissez le dossier de sauvegarde dans iCloud Drive (Réglages iCloud…).",
                       "Choose the backup folder in iCloud Drive (iCloud Settings…).")
         }
+        if let source = Self.sourceOverlapping(iCloudFolder: folder) {
+            return tr("Le dossier iCloud choisi se trouve dans « \(source.label) » (ou le contient) : choisissez un autre dossier (Réglages iCloud…).",
+                      "The chosen iCloud folder is inside “\(source.label)” (or contains it): choose another folder (iCloud Settings…).")
+        }
         if !hasICloudPassword {
             return tr("Définissez le mot de passe des archives (Réglages iCloud…).",
                       "Set the archive password (iCloud Settings…).")
         }
         return nil
+    }
+
+    /// Élément sauvegardé dont le dossier contient le dossier iCloud choisi, ou y est contenu
+    /// (avec « Bureau et Documents » dans iCloud, Documents est dans iCloud Drive) : les archives
+    /// seraient écrites dans les fichiers d'origine.
+    static func sourceOverlapping(iCloudFolder folder: URL) -> BackupSource? {
+        BackupSource.all.first { source in
+            source.folderURL.map { SyncEngine.overlaps($0, folder) } ?? false
+        }
     }
 
     /// Chemin du dossier iCloud tel que le Finder l'affiche (« iCloud Drive › MY SIMPLE BACKUP »).
@@ -695,6 +708,11 @@ final class BackupController: ObservableObject {
         guard ICloudDrive.contains(url) else {
             errorMessage = tr("Ce dossier n'est pas dans iCloud Drive. Choisissez un dossier dans iCloud Drive.",
                               "This folder is not in iCloud Drive. Choose a folder in iCloud Drive.")
+            return
+        }
+        if let source = Self.sourceOverlapping(iCloudFolder: url) {
+            errorMessage = tr("Ce dossier se trouve dans « \(source.label) » (ou le contient), qui fait partie des éléments sauvegardés : les archives seraient écrites parmi vos fichiers d'origine. Choisissez un autre dossier, par exemple « MY SIMPLE BACKUP » à la racine d'iCloud Drive.",
+                              "This folder is inside “\(source.label)” (or contains it), which is one of the backed-up items: the archives would be written among your original files. Choose another folder, for example “MY SIMPLE BACKUP” at the root of iCloud Drive.")
             return
         }
         iCloudFolder = url

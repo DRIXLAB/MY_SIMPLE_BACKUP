@@ -109,6 +109,8 @@ public final class ICloudChainRestore {
         guard !element.steps.isEmpty, step >= 0, step < min(element.steps.count, journals.count) else {
             throw Failure.noBackup(element.name)
         }
+        // La restauration n'écrit jamais dans les sauvegardes elles-mêmes.
+        try SyncEngine.checkNoOverlap(source: element.folder, destination: destination)
         try prepareDestination(destination)
 
         let plan = RestorePlan(deltas: Array(journals.prefix(step + 1)))

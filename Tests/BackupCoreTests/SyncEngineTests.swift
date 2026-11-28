@@ -75,6 +75,62 @@ final class SyncEngineTests: XCTestCase {
         XCTAssertEqual(tempFiles(in: dst), [])
     }
 
+    /// Empreinte de chaque élément de la source (sauf la date de dernier accès, que toute lecture
+    /// met à jour) : contenu, inode, nombre de liens, droits, taille, dates de modification et de
+    /// changement d'état, cible des liens.
+    func sourceFingerprint() throws -> [String: [String]] {
+        var result: [String: [String]] = [:]
+        for rel in ((fm.enumerator(atPath: src.path)?.allObjects as? [String]) ?? []) + [""] {
+            let path = rel.isEmpty ? src.path : src.appendingPathComponent(rel).path
+            var info = stat()
+            let status = lstat(path, &info)
+            XCTAssertEqual(status, 0, path)
+            #if canImport(Darwin)
+            let (modified, changed) = (info.st_mtimespec, info.st_ctimespec)
+            let flags = "drapeaux \(info.st_flags)"
+            #else
+            let (modified, changed) = (info.st_mtim, info.st_ctim)
+            let flags = ""
+            #endif
+            var fields = ["inode \(info.st_ino)", "liens \(info.st_nlink)", "mode \(info.st_mode)", "taille \(info.st_size)",
+                          "modif \(modified.tv_sec).\(modified.tv_nsec)", "etat \(changed.tv_sec).\(changed.tv_nsec)", flags]
+            switch info.st_mode & S_IFMT {
+            case S_IFREG: fields.append("contenu " + (try Data(contentsOf: URL(fileURLWithPath: path))).base64EncodedString())
+            case S_IFLNK: fields.append("cible " + ((try? fm.destinationOfSymbolicLink(atPath: path)) ?? "?"))
+            default: break
+            }
+            result[rel] = fields
+        }
+        return result
+    }
+
+    func testSourceIsNeverModified() throws {
+        try write("a.txt", "alpha", mtime: Date(timeIntervalSince1970: 1_600_000_000))
+        try write("dossier/b.txt", "bravo")
+        try write("remplace.txt", "nouveau")
+        try write("lecture-seule.txt", "ro")
+        XCTAssertEqual(chmod(src.appendingPathComponent("lecture-seule.txt").path, 0o444), 0)
+        try write("special.sh", "#!/bin/sh")
+        XCTAssertEqual(chmod(src.appendingPathComponent("special.sh").path, 0o4755), 0)
+        try fm.createDirectory(at: src.appendingPathComponent("protege"), withIntermediateDirectories: true)
+        try write("protege/c.txt", "charlie")
+        try fm.createSymbolicLink(atPath: src.appendingPathComponent("lien").path, withDestinationPath: "a.txt")
+        try fm.createSymbolicLink(atPath: src.appendingPathComponent("lien-externe").path, withDestinationPath: "/etc")
+        XCTAssertEqual(chmod(src.appendingPathComponent("protege").path, 0o555), 0)
+        defer { _ = chmod(src.appendingPathComponent("protege").path, 0o755) }
+        // Destination déjà remplie : remplacements, suppressions (option activée).
+        try write("remplace.txt", "ancien contenu plus long", in: dst)
+        try write("en-trop.txt", "x", in: dst)
+
+        let before = try sourceFingerprint()
+        _ = try sync(delete: true)
+        XCTAssertEqual(try sourceFingerprint(), before, "première sauvegarde")
+        try write("a.txt", "alpha modifié", in: dst) // la destination diverge : recopie
+        _ = try sync(delete: true)
+        XCTAssertEqual(try sourceFingerprint(), before, "seconde sauvegarde")
+        XCTAssertEqual(read("remplace.txt"), "nouveau")
+    }
+
     func testSecondRunCopiesNothing() throws {
         try write("a.txt", "alpha")
         try write("d/b.txt", "bravo")

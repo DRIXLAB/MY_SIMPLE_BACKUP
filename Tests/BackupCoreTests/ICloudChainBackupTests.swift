@@ -23,6 +23,8 @@ final class ICloudChainBackupTests: XCTestCase {
     }
 
     override func tearDownWithError() throws {
+        // Fichier « verrouillé » d'un test : déverrouillé pour pouvoir tout supprimer.
+        _ = chflags(source.appendingPathComponent("verrouille.txt").path, 0)
         try? fm.removeItem(at: root)
     }
 
@@ -135,7 +137,7 @@ final class ICloudChainBackupTests: XCTestCase {
         let first = try backup().run()
         try write("a.txt", "alpha modifié", ageSeconds: 60)
         _ = try backup().run()
-        Thread.sleep(forTimeInterval: 1.1) // nom de chaîne horodaté à la seconde
+        // Même seconde que la première chaîne : son dossier doit quand même être distinct.
         let fresh = try backup().run(startNewChain: true)
         XCTAssertEqual(fresh.step, 0)
         XCTAssertEqual(fresh.kind, .complete)
@@ -157,6 +159,95 @@ final class ICloudChainBackupTests: XCTestCase {
     func testCancelledFirstBackupLeavesNothing() throws {
         XCTAssertThrowsError(try backup().run(isCancelled: { true }))
         XCTAssertEqual(ChainLayout.chains(in: destination), [])
+    }
+
+    // MARK: Originaux jamais modifiés
+
+    /// Empreinte complète de chaque élément de la source (sauf la date de dernier accès, que toute
+    /// lecture met à jour) : contenu, inode, nombre de liens, droits, drapeaux, dates de
+    /// modification, de changement d'état et de création, attributs étendus.
+    private func fingerprint() throws -> [String: [String]] {
+        var result: [String: [String]] = [:]
+        let paths = (fm.enumerator(atPath: source.path)?.allObjects as? [String]) ?? []
+        for rel in paths + [""] {
+            let path = rel.isEmpty ? source.path : source.appendingPathComponent(rel).path
+            var info = stat()
+            let status = lstat(path, &info)
+            XCTAssertEqual(status, 0, path)
+            func time(_ t: timespec) -> String { "\(t.tv_sec).\(t.tv_nsec)" }
+            var fields = ["inode \(info.st_ino)", "liens \(info.st_nlink)", "mode \(info.st_mode)",
+                          "drapeaux \(info.st_flags)", "taille \(info.st_size)",
+                          "modif \(time(info.st_mtimespec))", "etat \(time(info.st_ctimespec))",
+                          "creation \(time(info.st_birthtimespec))"]
+            if info.st_mode & S_IFMT == S_IFREG {
+                fields.append("contenu " + (try Data(contentsOf: URL(fileURLWithPath: path))).base64EncodedString())
+            }
+            let length = listxattr(path, nil, 0, XATTR_NOFOLLOW)
+            if length > 0 {
+                var names = [CChar](repeating: 0, count: length)
+                _ = listxattr(path, &names, length, XATTR_NOFOLLOW)
+                fields.append("xattr \(names)")
+            }
+            result[rel] = fields
+        }
+        return result
+    }
+
+    private func leftoverStaging() -> [String] {
+        ((try? fm.contentsOfDirectory(atPath: fm.temporaryDirectory.path)) ?? []).filter { $0.hasPrefix("msb-lot-") }
+    }
+
+    func testOriginalsAreNeverModified() throws {
+        // Cas délicats : attribut étendu, lien symbolique, fichier « verrouillé » dans le Finder,
+        // fichier en lecture seule, dossier vide.
+        let tagged = source.appendingPathComponent("a.txt").path
+        let tag = Array("rouge".utf8)
+        XCTAssertEqual(setxattr(tagged, "com.example.etiquette", tag, tag.count, 0, 0), 0)
+        try fm.createSymbolicLink(atPath: source.appendingPathComponent("lien").path, withDestinationPath: "a.txt")
+        try write("verrouille.txt", "ne pas toucher")
+        try write("lecture-seule.txt", "lecture seule")
+        XCTAssertEqual(chmod(source.appendingPathComponent("lecture-seule.txt").path, 0o444), 0)
+        try fm.createDirectory(at: source.appendingPathComponent("vide"), withIntermediateDirectories: true)
+        XCTAssertEqual(chflags(source.appendingPathComponent("verrouille.txt").path, UInt32(UF_IMMUTABLE)), 0)
+        let staleBefore = Set(leftoverStaging())
+
+        let before = try fingerprint()
+        XCTAssertEqual(try backup().run().changedFiles, 5)
+        XCTAssertEqual(try fingerprint(), before, "archive complète")
+
+        try write("c.txt", "charlie modifié", ageSeconds: 60)
+        let beforeIncrement = try fingerprint()
+        XCTAssertEqual(try backup().run().step, 1)
+        XCTAssertEqual(try fingerprint(), beforeIncrement, "incrément")
+
+        // Aucune copie de travail laissée, même pour le fichier verrouillé.
+        XCTAssertEqual(Set(leftoverStaging()), staleBefore)
+
+        // Restauration : contenu et attribut étendu retrouvés.
+        let element = try XCTUnwrap(ICloudChainRestore.elements(in: destination.deletingLastPathComponent()).first)
+        let restore = ICloudChainRestore(element: element, password: "secret")
+        let target = root.appendingPathComponent("restaure")
+        let outcome = try restore.restore(upTo: 1, journals: try restore.journals(), to: target)
+        XCTAssertEqual(outcome.issues, [])
+        XCTAssertEqual(try String(contentsOf: target.appendingPathComponent("verrouille.txt")), "ne pas toucher")
+        XCTAssertEqual(try String(contentsOf: target.appendingPathComponent("c.txt")), "charlie modifié")
+        var value = [UInt8](repeating: 0, count: 16)
+        let length = getxattr(target.appendingPathComponent("a.txt").path, "com.example.etiquette", &value, 16, 0, 0)
+        XCTAssertEqual(length, 5)
+        XCTAssertEqual(Array(value.prefix(5)), tag)
+    }
+
+    func testDestinationInsideSourceIsRefusedBeforeAnyWrite() throws {
+        let before = try fingerprint()
+        let inside = ICloudChainBackup(source: source, destination: source.appendingPathComponent("iCloud/Documents"),
+                                       cacheFile: cache, password: "secret", uploader: nil)
+        XCTAssertThrowsError(try inside.run()) { error in
+            guard case SyncError.overlappingPaths = error else { return XCTFail("\(error)") }
+        }
+        XCTAssertEqual(try fingerprint(), before, "rien n'a été écrit dans la source")
+        // Source dans la destination : refusé aussi.
+        let around = ICloudChainBackup(source: source, destination: root, cacheFile: cache, password: "secret", uploader: nil)
+        XCTAssertThrowsError(try around.run())
     }
 }
 #endif

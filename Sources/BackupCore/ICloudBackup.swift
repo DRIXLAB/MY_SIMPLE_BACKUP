@@ -224,6 +224,9 @@ public final class ICloudChainBackup {
     public func run(startNewChain: Bool = false,
                     isCancelled: @escaping () -> Bool = { false },
                     progress: (Progress) -> Void = { _ in }) throws -> Outcome {
+        // Sécurité, avant toute écriture ou tout nettoyage : jamais dans la source (dossier iCloud
+        // choisi à l'intérieur de « Documents » synchronisé avec iCloud, par exemple).
+        try SyncEngine.checkNoOverlap(source: source, destination: destination)
         try fm.createDirectory(at: destination, withIntermediateDirectories: true)
         try removeIncompleteSteps()
 
