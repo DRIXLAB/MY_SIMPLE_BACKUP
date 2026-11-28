@@ -95,6 +95,9 @@ final class ICloudRestoreTests: XCTestCase {
                        try Data(contentsOf: source.appendingPathComponent("gros.bin")))
         var isDir: ObjCBool = false
         XCTAssertTrue(fm.fileExists(atPath: latest.appendingPathComponent("dossier/vide").path, isDirectory: &isDir) && isDir.boolValue)
+        let savedDate = try XCTUnwrap(RestorePlan(deltas: journals).items["dossier"]?.modificationDate)
+        let restoredDate = try XCTUnwrap(fm.attributesOfItem(atPath: latest.appendingPathComponent("dossier").path)[.modificationDate] as? Date)
+        XCTAssertEqual(restoredDate.timeIntervalSince1970, savedDate.timeIntervalSince1970, accuracy: 1, "date du dossier rétablie")
         XCTAssertEqual(outcome.restoredFiles, 5) // a.txt, dossier/b.txt, nouveau.txt, lien, gros.bin
         XCTAssertEqual(last.partsDone, last.partsTotal)
         XCTAssertGreaterThan(last.partsTotal, 2, "gros.bin occupe plusieurs morceaux")
@@ -152,7 +155,7 @@ final class ICloudRestoreTests: XCTestCase {
         let restore = ICloudChainRestore(element: element, password: "secret")
         let target = root.appendingPathComponent("restaure")
         let outcome = try restore.restore(upTo: 0, journals: try restore.journals(), to: target)
-        XCTAssertTrue(outcome.issues.contains { $0.path == damaged.lastPathComponent })
+        XCTAssertTrue(outcome.issues.contains { $0.path.hasSuffix("/" + damaged.lastPathComponent) })
         XCTAssertGreaterThan(outcome.restoredFiles, 0, "les autres morceaux sont restaurés")
     }
 

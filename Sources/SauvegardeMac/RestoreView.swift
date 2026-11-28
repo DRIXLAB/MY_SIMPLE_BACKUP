@@ -161,11 +161,12 @@ final class RestoreModel: ObservableObject {
     func restore() {
         guard let element, let journals, let parentFolder, let name = restoreFolderName,
               let password = password() else { return }
-        let destination = parentFolder.appendingPathComponent(name, isDirectory: true)
-        if FileManager.default.fileExists(atPath: destination.path) {
-            errorMessage = tr("Le dossier « \(name) » existe déjà à cet endroit. Choisissez un autre emplacement ou renommez-le.",
-                              "The folder “\(name)” already exists there. Choose another location or rename it.")
-            return
+        // Jamais par-dessus un dossier existant : « … 2 », « … 3 »… si le nom est déjà pris.
+        var destination = parentFolder.appendingPathComponent(name, isDirectory: true)
+        var suffix = 2
+        while FileManager.default.fileExists(atPath: destination.path) {
+            destination = parentFolder.appendingPathComponent("\(name) \(suffix)", isDirectory: true)
+            suffix += 1
         }
         let cancel = CancellationFlag()
         cancelFlag = cancel
@@ -357,7 +358,7 @@ struct RestoreView: View {
                 }
             }
         }
-        .disabled(model.phase == .reading ? true : false)
+        .disabled(model.phase == .reading)
     }
 
     private func display(_ url: URL) -> String {

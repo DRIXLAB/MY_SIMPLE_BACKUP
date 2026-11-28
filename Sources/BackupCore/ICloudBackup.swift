@@ -83,7 +83,12 @@ public final class ICloudUploadQueue {
             if isCancelled() { throw ICloudDrive.Failure.cancelled }
             _ = condition.wait(until: Date().addingTimeInterval(1))
         }
-        if let failure { throw failure }
+        // L'erreur est rendue une seule fois : elle concerne l'élément en cours (dont l'étape est
+        // alors supprimée), pas les suivants, qui repartent d'une file vide.
+        if let error = failure {
+            failure = nil
+            throw error
+        }
     }
 
     private func work() {
@@ -125,6 +130,9 @@ public final class ICloudUploadQueue {
             } catch {
                 condition.lock()
                 failure = error
+                queue.removeAll()
+                pendingBytes = 0
+                waitingForICloud = false
                 workerRunning = false
                 condition.broadcast()
                 condition.unlock()
@@ -222,14 +230,15 @@ public final class ICloudChainBackup {
         progress(Progress(phase: .scanning))
         let current = startNewChain ? nil : ChainLayout.currentChain(in: destination)
         let now = Date()
-        let chainURL = current?.url
-            ?? destination.appendingPathComponent(ChainLayout.chainFolderName(date: now), isDirectory: true)
+        let chainURL = current?.url ?? newChainURL(date: now)
         let stepNumber = current?.steps.count ?? 0
         let kind: ChainDelta.Kind = stepNumber == 0 ? .complete : .increment
         let previous = try current.map { try state(of: $0.url, steps: $0.steps) } ?? ChainState()
+        let key = try chainKey(of: current?.steps.first)
 
         let scan = try ArchivePlan.scan(source, isCancelled: isCancelled)
-        let diff = ChainDiff.compute(previous: previous, current: scan.items, modifyWindow: options.modifyWindow)
+        let diff = ChainDiff.compute(previous: previous, current: scan.items,
+                                    unreadable: scan.issues.map(\.path), modifyWindow: options.modifyWindow)
         var outcome = Outcome(step: nil, kind: nil, chainName: chainURL.lastPathComponent,
                               sourceFiles: scan.items.filter { $0.kind == .file }.count, issues: scan.issues)
         if kind == .increment, diff.changed.isEmpty, diff.deleted.isEmpty {
@@ -248,7 +257,7 @@ public final class ICloudChainBackup {
             if !changed.isEmpty {
                 let dataURL = stepURL.appendingPathComponent(ChainLayout.dataFolder, isDirectory: true)
                 let result = try EncryptedArchive.create(
-                    from: source, items: changed, to: dataURL, password: password,
+                    from: source, items: changed, to: dataURL, password: password, key: key,
                     partSize: options.partSize, iterations: options.iterations,
                     beforeNewPart: { try self.uploader?.waitForRoom() },
                     onPartCompleted: { url, size in
@@ -267,7 +276,7 @@ public final class ICloudChainBackup {
             }
 
             let delta = ChainDelta(step: stepNumber, kind: kind, date: now, changed: changed, deleted: diff.deleted)
-            try writeJournal(delta, in: stepURL)
+            try writeJournal(delta, in: stepURL, key: key)
 
             progress(Progress(phase: .uploading, bytesToArchive: bytesToArchive, partsWritten: partsWritten))
             try uploader?.waitUntilEmpty()
@@ -332,14 +341,32 @@ public final class ICloudChainBackup {
         return try JSONDecoder().decode(ChainDelta.self, from: data)
     }
 
-    private func writeJournal(_ delta: ChainDelta, in stepURL: URL) throws {
+    /// Dossier d'une nouvelle chaîne, horodaté ; jamais celui d'une chaîne existante (deux
+    /// chaînes créées dans la même seconde).
+    private func newChainURL(date: Date) -> URL {
+        let existing = Set(ChainLayout.chains(in: destination).map(\.lastPathComponent))
+        var date = date
+        while existing.contains(ChainLayout.chainFolderName(date: date)) { date += 1 }
+        return destination.appendingPathComponent(ChainLayout.chainFolderName(date: date), isDirectory: true)
+    }
+
+    /// Clé de la chaîne : celle de son archive complète (une seule dérivation du mot de passe
+    /// pour toute la chaîne, mise en cache), ou une nouvelle clé pour une nouvelle chaîne.
+    private func chainKey(of firstStep: ChainLayout.Step?) throws -> EncryptedArchive.Key {
+        guard let firstStep else { return try .generate(password: password, iterations: options.iterations) }
+        let journal = firstStep.url.appendingPathComponent(ChainLayout.journalFolder)
+        try fetch(journal.appendingPathComponent(EncryptedArchive.keyFileName))
+        return try .load(in: journal, password: password)
+    }
+
+    private func writeJournal(_ delta: ChainDelta, in stepURL: URL, key: EncryptedArchive.Key) throws {
         let temporary = fm.temporaryDirectory.appendingPathComponent("msb-journal-\(UUID().uuidString)")
         defer { try? fm.removeItem(at: temporary) }
         try fm.createDirectory(at: temporary, withIntermediateDirectories: true)
         try JSONEncoder().encode(delta).write(to: temporary.appendingPathComponent(ChainLayout.journalFileName))
         let journalURL = stepURL.appendingPathComponent(ChainLayout.journalFolder, isDirectory: true)
-        let result = try EncryptedArchive.create(from: temporary, to: journalURL, password: password,
-                                                 partSize: .max, iterations: options.iterations)
+        let result = try EncryptedArchive.create(from: temporary, to: journalURL, password: password, key: key,
+                                                 partSize: .max)
         for part in result.parts { enqueueSmallFile(part) }
         enqueueSmallFile(journalURL.appendingPathComponent(EncryptedArchive.keyFileName))
     }

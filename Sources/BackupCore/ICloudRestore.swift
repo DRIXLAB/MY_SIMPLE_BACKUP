@@ -137,22 +137,25 @@ public final class ICloudChainRestore {
         defer { try? fm.removeItem(at: staging) }
 
         for entry in readers {
+            let stepName = element.steps[entry.step].url.lastPathComponent
             guard let reader = entry.reader else {
-                outcome.issues.append(SyncIssue(path: element.steps[entry.step].url.lastPathComponent,
-                                                message: entry.error?.localizedDescription ?? "?"))
+                outcome.issues.append(SyncIssue(path: stepName, message: entry.error?.localizedDescription ?? "?"))
                 continue
             }
             let wanted = plan.paths(fromStep: entry.step)
             for part in reader.parts {
                 if isCancelled() { throw SyncError.cancelled }
-                try? fm.removeItem(at: staging)
+                // Un dossier provisoire neuf par morceau : rien ne reste d'un morceau précédent.
+                let partStaging = staging.appendingPathComponent(UUID().uuidString, isDirectory: true)
+                defer { try? fm.removeItem(at: partStaging) }
                 do {
                     try fetch(part)
-                    try reader.extract(part, to: staging)
+                    try reader.extract(part, to: partStaging)
                 } catch let error as ICloudDrive.Failure where error == .cancelled {
                     throw SyncError.cancelled
                 } catch {
-                    outcome.issues.append(SyncIssue(path: part.lastPathComponent, message: error.localizedDescription))
+                    outcome.issues.append(SyncIssue(path: stepName + "/" + part.lastPathComponent,
+                                                    message: error.localizedDescription))
                     release(part)
                     current.partsDone += 1
                     progress(current)
@@ -161,12 +164,12 @@ public final class ICloudChainRestore {
                 release(part)
 
                 // Déplace les éléments voulus (dernière version) depuis le dossier provisoire.
-                let extracted = (try? ArchivePlan.scan(staging).items) ?? []
+                let extracted = (try? ArchivePlan.scan(partStaging).items) ?? []
                 for item in extracted where item.kind != .directory && wanted.contains(item.path) && remaining.contains(item.path) {
                     let target = destination.appendingPathComponent(item.path)
                     do {
                         try fm.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
-                        try fm.moveItem(at: staging.appendingPathComponent(item.path), to: target)
+                        try fm.moveItem(at: partStaging.appendingPathComponent(item.path), to: target)
                         remaining.remove(item.path)
                         outcome.restoredFiles += 1
                         outcome.restoredBytes += item.size
@@ -181,9 +184,15 @@ public final class ICloudChainRestore {
             }
         }
 
-        // Dossiers (y compris vides) de l'état restauré.
-        for item in plan.items.values where item.kind == .directory {
+        // Dossiers (y compris vides) de l'état restauré, puis leurs dates d'origine (les
+        // déplacements de fichiers ci-dessus les ont modifiées).
+        let directories = plan.items.values.filter { $0.kind == .directory }
+        for item in directories {
             try? fm.createDirectory(at: destination.appendingPathComponent(item.path), withIntermediateDirectories: true)
+        }
+        for item in directories {
+            try? fm.setAttributes([.modificationDate: item.modificationDate],
+                                  ofItemAtPath: destination.appendingPathComponent(item.path).path)
         }
         for path in remaining.sorted() {
             outcome.issues.append(SyncIssue(path: path, message: tr("non restauré (absent des archives lisibles)",

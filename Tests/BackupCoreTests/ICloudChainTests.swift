@@ -42,6 +42,22 @@ final class ICloudChainTests: XCTestCase {
         XCTAssertEqual(diff.deleted, ["x/in"])
     }
 
+    func testUnreadableFolderIsNotCountedAsDeleted() {
+        let previous = ChainState(items: [dir("prive"), file("prive/a", 1), dir("prive/sous"), file("prive/sous/b", 2),
+                                          file("prive-bis", 3), file("verrou", 4), file("parti", 5)])
+        // « prive » illisible et « verrou » inaccessible : listés dans les problèmes de l'inventaire.
+        let current = [dir("prive"), file("prive-bis", 3), file("autre", 1)]
+        let diff = ChainDiff.compute(previous: previous, current: current, unreadable: ["prive", "verrou"])
+        XCTAssertEqual(diff.changed.map(\.path), ["autre"])
+        XCTAssertEqual(diff.deleted, ["parti"], "« prive-bis » n'est pas sous « prive »")
+    }
+
+    func testEmptySourceDeletesNothing() {
+        let previous = ChainState(items: [file("a", 1), file("b", 2)])
+        XCTAssertEqual(ChainDiff.compute(previous: previous, current: []).deleted, [])
+        XCTAssertEqual(ChainDiff.compute(previous: previous, current: [file("c", 1)], unreadable: [""]).deleted, [])
+    }
+
     func testStateAppliesDeltasInOrder() {
         var state = ChainState()
         state.apply(ChainDelta(step: 0, kind: .complete, date: t0, changed: [file("a", 1), file("b", 2)], deleted: []))

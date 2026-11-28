@@ -60,9 +60,14 @@ public struct ChainState: Equatable, Sendable {
 
 /// Comparaison entre l'état sauvegardé et l'inventaire actuel de la source.
 public enum ChainDiff {
+    /// - Parameters:
+    ///   - unreadable: chemins que l'inventaire n'a pas pu lire (dossiers illisibles, éléments
+    ///     inaccessibles) : ni eux ni leur contenu ne sont comptés comme supprimés, comme pour la
+    ///     copie vers le disque (un dossier momentanément illisible ne doit pas « disparaître »).
     /// - Returns: éléments nouveaux ou modifiés (taille, type, ou date à `modifyWindow` près ;
-    ///   pour un dossier, seulement s'il est nouveau) et chemins disparus, triés.
-    public static func compute(previous: ChainState, current: [ArchiveItem],
+    ///   pour un dossier, seulement s'il est nouveau) et chemins disparus, triés. Si l'inventaire
+    ///   est vide, aucune suppression (source vide : probablement un problème d'accès).
+    public static func compute(previous: ChainState, current: [ArchiveItem], unreadable: [String] = [],
                                modifyWindow: TimeInterval = 2) -> (changed: [ArchiveItem], deleted: [String]) {
         var changed: [ArchiveItem] = []
         for item in current {
@@ -78,9 +83,13 @@ public enum ChainDiff {
                 changed.append(item)
             }
         }
+        changed.sort { $0.path < $1.path }
+        guard !current.isEmpty, !unreadable.contains("") else { return (changed, []) }
         let present = Set(current.map(\.path))
-        let deleted = previous.items.keys.filter { !present.contains($0) }.sorted()
-        return (changed.sorted { $0.path < $1.path }, deleted)
+        let deleted = previous.items.keys.filter { path in
+            !present.contains(path) && !unreadable.contains { path == $0 || path.hasPrefix($0 + "/") }
+        }.sorted()
+        return (changed, deleted)
     }
 }
 

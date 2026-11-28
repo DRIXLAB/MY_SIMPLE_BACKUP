@@ -76,12 +76,45 @@ public enum EncryptedArchive {
         var salt: Data
     }
 
+    /// Clé de chiffrement prête à l'emploi, avec ses paramètres de dérivation (écrits dans
+    /// `cle.json`). Une même clé peut servir à plusieurs archives (toute une chaîne iCloud) :
+    /// AEA dérive de toute façon une clé propre à chaque archive (HKDF, graine aléatoire).
+    public struct Key {
+        let parameters: KeyParameters
+        let key: SymmetricKey
+
+        /// Nouvelle clé : sel aléatoire, dérivation du mot de passe.
+        public static func generate(password: String, iterations: Int = EncryptedArchive.defaultIterations) throws -> Key {
+            var salt = Data(count: 16)
+            salt.withUnsafeMutableBytes { arc4random_buf($0.baseAddress!, $0.count) }
+            let parameters = KeyParameters(iterations: iterations, salt: salt)
+            return Key(parameters: parameters, key: try EncryptedArchive.deriveKey(password: password, parameters: parameters))
+        }
+
+        /// Clé d'une archive existante (paramètres lus dans son `cle.json`).
+        public static func load(in partsDirectory: URL, password: String) throws -> Key {
+            let parameters = try EncryptedArchive.readKeyParameters(in: partsDirectory)
+            return Key(parameters: parameters, key: try EncryptedArchive.deriveKey(password: password, parameters: parameters))
+        }
+    }
+
+    /// Clés déjà dérivées pendant la vie de l'app (la dérivation est volontairement lente) :
+    /// indexées par paramètres et empreinte du mot de passe, jamais écrites sur le disque.
+    private static let keyCacheLock = NSLock()
+    private static var keyCache: [String: SymmetricKey] = [:]
+
     /// Clé AES-256 dérivée du mot de passe.
     static func deriveKey(password: String, parameters: KeyParameters) throws -> SymmetricKey {
         guard parameters.algorithm == "PBKDF2-HMAC-SHA256", parameters.iterations > 0,
               !parameters.salt.isEmpty else {
             throw Failure.unreadableArchive
         }
+        let fingerprint = SHA256.hash(data: Data(password.utf8)).map { String(format: "%02x", $0) }.joined()
+        let cacheKey = "\(parameters.iterations)|\(parameters.salt.base64EncodedString())|\(fingerprint)"
+        keyCacheLock.lock()
+        let cached = keyCache[cacheKey]
+        keyCacheLock.unlock()
+        if let cached { return cached }
         let passwordBytes = Array(password.utf8).map { CChar(bitPattern: $0) }
         var derived = [UInt8](repeating: 0, count: 32)
         let status: Int32 = passwordBytes.withUnsafeBufferPointer { pwd in
@@ -95,7 +128,11 @@ public enum EncryptedArchive {
             }
         }
         guard Int(status) == kCCSuccess else { throw Failure.cannotCreateStream("key") }
-        return SymmetricKey(data: derived)
+        let key = SymmetricKey(data: derived)
+        keyCacheLock.lock()
+        keyCache[cacheKey] = key
+        keyCacheLock.unlock()
+        return key
     }
 
     static func writeKeyParameters(_ parameters: KeyParameters, in directory: URL) throws {
@@ -115,6 +152,7 @@ public enum EncryptedArchive {
 
     /// Archive `items` (par défaut tout le contenu de `sourceDirectory`) dans `partsDirectory`.
     /// - Parameters:
+    ///   - key: clé à utiliser (celle de la chaîne) ; par défaut, une nouvelle clé (`iterations`).
     ///   - partSize: taille visée d'un morceau, en octets (un fichier plus gros forme un morceau seul).
     ///   - beforeNewPart: appelé avant chaque morceau ; peut bloquer (contre-pression) ou lever une erreur.
     ///   - onPartCompleted: appelé quand un morceau est écrit et fermé, avec son URL et sa taille.
@@ -126,6 +164,7 @@ public enum EncryptedArchive {
         items: [ArchiveItem]? = nil,
         to partsDirectory: URL,
         password: String,
+        key givenKey: Key? = nil,
         partSize: Int64 = 1 << 30,
         iterations: Int = defaultIterations,
         beforeNewPart: () throws -> Void = {},
@@ -137,11 +176,9 @@ public enum EncryptedArchive {
         let toArchive = try items ?? ArchivePlan.scan(sourceDirectory, isCancelled: isCancelled).items
         try fm.createDirectory(at: partsDirectory, withIntermediateDirectories: true)
 
-        var salt = Data(count: 16)
-        salt.withUnsafeMutableBytes { arc4random_buf($0.baseAddress!, $0.count) }
-        let parameters = KeyParameters(iterations: iterations, salt: salt)
-        let key = try deriveKey(password: password, parameters: parameters)
-        try writeKeyParameters(parameters, in: partsDirectory)
+        let chosen = try givenKey ?? Key.generate(password: password, iterations: iterations)
+        let key = chosen.key
+        try writeKeyParameters(chosen.parameters, in: partsDirectory)
 
         var written: [URL] = []
         var issues: [SyncIssue] = []

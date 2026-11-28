@@ -73,6 +73,25 @@ final class ICloudChainBackupTests: XCTestCase {
         XCTAssertFalse(everything.contains { $0.contains("bravo") || $0.contains("b.txt") || $0.contains("nouveau") })
     }
 
+    func testWholeChainSharesOneKey() throws {
+        _ = try backup().run()
+        try write("a.txt", "alpha modifié", ageSeconds: 60)
+        _ = try backup().run()
+        let chain = try XCTUnwrap(ChainLayout.currentChain(in: destination))
+        XCTAssertEqual(chain.steps.count, 2)
+        let salts = try chain.steps.flatMap { step in
+            try [ChainLayout.dataFolder, ChainLayout.journalFolder].map {
+                try EncryptedArchive.readKeyParameters(in: step.url.appendingPathComponent($0)).salt
+            }
+        }
+        XCTAssertEqual(Set(salts).count, 1, "une seule dérivation du mot de passe pour toute la chaîne")
+        // Une nouvelle chaîne a sa propre clé.
+        _ = try backup().run(startNewChain: true)
+        let fresh = try XCTUnwrap(ChainLayout.currentChain(in: destination)?.steps.first)
+        XCTAssertNotEqual(try EncryptedArchive.readKeyParameters(in: fresh.url.appendingPathComponent(ChainLayout.journalFolder)).salt,
+                          salts[0])
+    }
+
     func testStepDataContainsOnlyChangedFiles() throws {
         _ = try backup().run()
         try write("dossier/b.txt", "bravo bis", ageSeconds: 60)

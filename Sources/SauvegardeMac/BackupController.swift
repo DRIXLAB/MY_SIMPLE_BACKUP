@@ -70,6 +70,10 @@ final class BackupController: ObservableObject {
     var isRestoring = false
     /// Avancement de la ligne iCloud en cours.
     @Published private(set) var cloudProgress: CloudProgress?
+    /// Octets envoyés par la file iCloud (cumul de la sauvegarde) au début de la ligne en cours,
+    /// pour n'afficher que ceux de cette ligne.
+    private var uploadedAtRowStart: Int64 = 0
+    private var uploadedSoFar: Int64 = 0
 
     /// Avertissements à confirmer avant de lancer la sauvegarde.
     @Published var confirmation: [String] = []
@@ -215,12 +219,13 @@ final class BackupController: ObservableObject {
             return
         }
         let diskReady = destination.map { FileManager.default.fileExists(atPath: $0.path) } ?? false
-        if iCloudEnabled {
-            if let problem = iCloudProblem {
-                errorMessage = problem
-                return
-            }
-        } else {
+        // iCloud pas prêt : on fait quand même la sauvegarde sur disque si elle est possible.
+        let cloudProblem = iCloudEnabled ? iCloudProblem : nil
+        if iCloudEnabled, let cloudProblem, !diskReady {
+            errorMessage = cloudProblem
+            return
+        }
+        if !iCloudEnabled {
             guard let destination else {
                 errorMessage = tr("Cliquez sur « Choisir… » pour sélectionner un dossier de destination.",
                                   "Click “Choose…” to select a destination folder.")
@@ -235,7 +240,10 @@ final class BackupController: ObservableObject {
 
         refresh()
         var warnings: [String] = []
-        if iCloudEnabled, !diskReady {
+        if let cloudProblem {
+            warnings.append(tr("iCloud n'est pas prêt : seule la sauvegarde sur le disque externe sera faite. ",
+                               "iCloud is not ready: only the external disk backup will run. ") + cloudProblem)
+        } else if iCloudEnabled, !diskReady {
             warnings.append(tr("Disque externe non connecté : seule la sauvegarde iCloud sera faite.",
                                "External disk not connected: only the iCloud backup will run."))
         }
@@ -256,7 +264,7 @@ final class BackupController: ObservableObject {
                                "Deletion mode enabled: files in the destination that are no longer on your Mac will be permanently deleted."))
         }
         let resets = selected.filter { pendingFullArchive.contains($0.id) }.map(\.label)
-        if iCloudEnabled, !resets.isEmpty {
+        if iCloudEnabled, cloudProblem == nil, !resets.isEmpty {
             let names = resets.joined(separator: ", ")
             warnings.append(tr("iCloud repartira d'une archive complète pour : \(names). Tout sera renvoyé ; les anciennes archives seront supprimées une fois la nouvelle terminée.",
                                "iCloud will start over from a full archive for: \(names). Everything will be uploaded again; the old archives will be deleted once the new one is complete."))
@@ -276,7 +284,7 @@ final class BackupController: ObservableObject {
         let delete = deleteExtraneous
         let disk = destination.flatMap { FileManager.default.fileExists(atPath: $0.path) ? $0 : nil }
         var cloud: CloudPlan?
-        if iCloudEnabled, let folder = iCloudFolder {
+        if iCloudEnabled, iCloudProblem == nil, let folder = iCloudFolder {
             do {
                 guard let password = try PasswordKeychain.read(), !password.isEmpty else {
                     hasICloudPassword = false
@@ -296,6 +304,8 @@ final class BackupController: ObservableObject {
 
         isRunning = true
         progress = nil
+        uploadedSoFar = 0
+        uploadedAtRowStart = 0
         let flag = CancellationFlag()
         cancelFlag = flag
         setWindowsClosable(false)
@@ -552,6 +562,7 @@ final class BackupController: ObservableObject {
     private func beginSource(_ id: String) {
         progress = nil
         cloudProgress = nil
+        uploadedAtRowStart = uploadedSoFar
         progressSourceID = id
         guard let i = run?.sources.firstIndex(where: { $0.id == id }) else { return }
         run?.sources[i].status = .running
@@ -598,9 +609,10 @@ final class BackupController: ObservableObject {
     }
 
     private func updateCloudUpload(_ status: ICloudUploadQueue.Status) {
+        uploadedSoFar = status.uploadedBytes
         guard isRunning, progressSourceID?.hasPrefix(SourceReport.cloudPrefix) == true else { return }
         var current = cloudProgress ?? CloudProgress()
-        current.uploadedBytes = status.uploadedBytes
+        current.uploadedBytes = max(0, status.uploadedBytes - uploadedAtRowStart)
         current.pendingBytes = status.pendingBytes
         current.waitingForICloud = status.waitingForICloud
         cloudProgress = current
