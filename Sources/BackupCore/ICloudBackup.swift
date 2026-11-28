@@ -165,6 +165,20 @@ public final class ICloudChainBackup {
 
     public enum Phase: Equatable { case scanning, archiving, uploading }
 
+    public enum Failure: Error, Equatable, LocalizedError {
+        /// Le mot de passe ne déchiffre pas la chaîne en cours (mot de passe redéfini) : on ne
+        /// mélange jamais deux mots de passe dans une chaîne.
+        case passwordMismatch(String)
+
+        public var errorDescription: String? {
+            switch self {
+            case .passwordMismatch(let name):
+                return tr("Le mot de passe enregistré ne correspond pas à la sauvegarde iCloud existante de « \(name) ». Remettez l'ancien mot de passe, ou utilisez « Repartir d'une archive complète » dans les réglages iCloud.",
+                          "The saved password does not match the existing iCloud backup of “\(name)”. Restore the previous password, or use “Start over from a full archive” in the iCloud settings.")
+            }
+        }
+    }
+
     public struct Progress: Equatable {
         public var phase: Phase
         /// Octets des éléments à archiver (fichiers nouveaux ou modifiés).
@@ -236,6 +250,15 @@ public final class ICloudChainBackup {
         let chainURL = current?.url ?? newChainURL(date: now)
         let stepNumber = current?.steps.count ?? 0
         let kind: ChainDelta.Kind = stepNumber == 0 ? .complete : .increment
+        if let first = current?.steps.first {
+            // Mot de passe vérifié sur l'archive complète (petit journal, clé mise en cache) :
+            // indispensable même quand le cache local évite de relire les journaux.
+            do {
+                _ = try readJournal(of: first.url)
+            } catch let error as EncryptedArchive.Failure where error != .cancelled {
+                throw Failure.passwordMismatch(source.lastPathComponent)
+            }
+        }
         let previous = try current.map { try state(of: $0.url, steps: $0.steps) } ?? ChainState()
         let key = try chainKey(of: current?.steps.first)
 
@@ -336,6 +359,12 @@ public final class ICloudChainBackup {
     }
 
     func readJournal(of step: URL) throws -> ChainDelta {
+        try Self.readJournal(of: step, password: password, fetch: fetch)
+    }
+
+    /// Journal chiffré d'une étape (sauvegarde et restauration), déchiffré hors d'iCloud.
+    static func readJournal(of step: URL, password: String, fetch: (URL) throws -> Void) throws -> ChainDelta {
+        let fm = FileManager.default
         let temporary = fm.temporaryDirectory.appendingPathComponent("msb-journal-\(UUID().uuidString)")
         defer { try? fm.removeItem(at: temporary) }
         try EncryptedArchive.extract(from: step.appendingPathComponent(ChainLayout.journalFolder),

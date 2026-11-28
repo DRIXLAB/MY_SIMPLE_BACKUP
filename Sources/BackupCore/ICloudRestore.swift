@@ -86,13 +86,8 @@ public final class ICloudChainRestore {
         var result: [ChainDelta] = []
         for step in element.steps {
             if isCancelled() { throw SyncError.cancelled }
-            let temporary = fm.temporaryDirectory.appendingPathComponent("msb-journal-\(UUID().uuidString)")
-            defer { try? fm.removeItem(at: temporary) }
             do {
-                try EncryptedArchive.extract(from: step.url.appendingPathComponent(ChainLayout.journalFolder),
-                                             to: temporary, password: password, beforeReading: fetch)
-                let data = try Data(contentsOf: temporary.appendingPathComponent(ChainLayout.journalFileName))
-                result.append(try JSONDecoder().decode(ChainDelta.self, from: data))
+                result.append(try ICloudChainBackup.readJournal(of: step.url, password: password, fetch: fetch))
             } catch let error as ICloudDrive.Failure {
                 throw error == .cancelled ? SyncError.cancelled : error
             } catch {

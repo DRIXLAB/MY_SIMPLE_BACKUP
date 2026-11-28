@@ -86,7 +86,7 @@ final class EncryptedArchiveTests: XCTestCase {
         XCTAssertEqual(try data(source, "sous/b1.bin"), before)
         let after = try fm.attributesOfItem(atPath: source.appendingPathComponent("sous/b1.bin").path)
         XCTAssertEqual(after[.modificationDate] as? Date, attributes[.modificationDate] as? Date)
-        // Les liens physiques temporaires ont bien été supprimés.
+        // Aucun lien physique vers l'original (copies de travail clonées).
         XCTAssertEqual((after[.referenceCount] as? NSNumber)?.intValue, 1)
     }
 

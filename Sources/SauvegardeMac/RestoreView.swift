@@ -19,7 +19,10 @@ final class RestoreModel: ObservableObject {
     @Published var useSavedPassword: Bool { didSet { journals = nil } }
     @Published var otherPassword = "" { didSet { if !useSavedPassword { journals = nil } } }
     /// Journaux de l'élément choisi, lus avec le mot de passe (prouve qu'il est correct).
-    @Published private(set) var journals: [ChainDelta]?
+    @Published private(set) var journals: [ChainDelta]? { didSet { if journals == nil { verifiedPassword = nil } } }
+    /// Mot de passe qui a permis de lire les journaux : réutilisé pour la restauration (le
+    /// trousseau n'est lu qu'une fois, macOS pouvant demander l'autorisation à chaque lecture).
+    private var verifiedPassword: String?
     @Published var stepNumber = 0
     @Published var parentFolder: URL?
     @Published private(set) var phase: Phase = .choosing
@@ -65,14 +68,15 @@ final class RestoreModel: ObservableObject {
         return L10n.count(files, "fichier", "fichiers", "file", "files") + " · " + L10n.bytes(plan.totalSize)
     }
 
-    /// Dossier créé pour la restauration : « Documents (restauré le 2026-11-27 14.05) ».
+    /// Dossier créé pour la restauration : « Images (sauvegarde du 2026-11-27 14.05) ».
     var restoreFolderName: String? {
         guard let element, stepNumber < element.steps.count else { return nil }
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.dateFormat = "yyyy-MM-dd HH.mm"
         let date = formatter.string(from: element.steps[stepNumber].date)
-        return tr("\(element.name) (sauvegarde du \(date))", "\(element.name) (backup of \(date))")
+        let name = Self.label(for: element.name)
+        return tr("\(name) (sauvegarde du \(date))", "\(name) (backup of \(date))")
     }
 
     // MARK: Actions
@@ -149,6 +153,7 @@ final class RestoreModel: ObservableObject {
                     try restore.journals(isCancelled: { cancel.isCancelled })
                 }
                 journals = result
+                verifiedPassword = password
                 stepNumber = max(0, result.count - 1)
             } catch {
                 if !cancel.isCancelled { errorMessage = error.localizedDescription }
@@ -160,7 +165,7 @@ final class RestoreModel: ObservableObject {
 
     func restore() {
         guard let element, let journals, let parentFolder, let name = restoreFolderName,
-              let password = password() else { return }
+              let password = verifiedPassword ?? password() else { return }
         // Jamais par-dessus un dossier existant : « … 2 », « … 3 »… si le nom est déjà pris.
         var destination = parentFolder.appendingPathComponent(name, isDirectory: true)
         var suffix = 2

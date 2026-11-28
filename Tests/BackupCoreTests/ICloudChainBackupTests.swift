@@ -146,6 +146,21 @@ final class ICloudChainBackupTests: XCTestCase {
         XCTAssertEqual(ChainLayout.chains(in: destination).map(\.lastPathComponent), [fresh.chainName])
     }
 
+    func testOtherPasswordNeverExtendsTheChain() throws {
+        _ = try backup().run()
+        try write("a.txt", "alpha modifié", ageSeconds: 60)
+        var options = ICloudChainBackup.Options()
+        options.iterations = 1_000
+        let other = ICloudChainBackup(source: source, destination: destination, cacheFile: cache,
+                                      password: "autre", options: options, uploader: nil)
+        XCTAssertThrowsError(try other.run()) { error in
+            XCTAssertEqual(error as? ICloudChainBackup.Failure, .passwordMismatch("Documents"))
+        }
+        XCTAssertEqual(ChainLayout.currentChain(in: destination)?.steps.count, 1, "aucune étape ajoutée")
+        // Nouvelle chaîne demandée : le nouveau mot de passe est accepté.
+        XCTAssertEqual(try other.run(startNewChain: true).step, 0)
+    }
+
     func testCancellationLeavesNoStepAndKeepsChain() throws {
         let first = try backup().run()
         try write("a.txt", "alpha modifié", ageSeconds: 60)
